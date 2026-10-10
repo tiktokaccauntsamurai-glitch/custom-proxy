@@ -1,0 +1,23 @@
+# Build output
+/target/
+
+# Proxy cores downloaded by scripts/fetch-*.{ps1,sh}
+/bin/
+
+# Release bundles
+/dist/
+
+# Local configs and logs must never be committed
+*.log
+settings.json
+run.json
+sysproxy-backup.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Personal git/push tooling - not part of the project, never shared.
+/exclude/

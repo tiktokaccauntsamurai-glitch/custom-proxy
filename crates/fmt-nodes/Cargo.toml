@@ -1,0 +1,15 @@
+[package]
+name = "fmt-nodes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log = "0.4"
+core-model = { path = "../core-model" }
+fmt-shadowrocket = { path = "../fmt-shadowrocket" }
+serde_json = "1"
+yaml-rust2 = { version = "0.13.0", default-features = false }
+
+[dev-dependencies]
+singbox-gen = { path = "../singbox-gen" }

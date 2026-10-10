@@ -1,0 +1,9 @@
+[package]
+name = "fmt-shadowrocket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log = "0.4"
+core-model = { path = "../core-model" }

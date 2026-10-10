@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/core-model", "crates/fmt-shadowrocket", "crates/fmt-nodes", "crates/singbox-gen", "crates/supervisor", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0-dev"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1

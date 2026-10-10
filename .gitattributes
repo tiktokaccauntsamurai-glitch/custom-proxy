@@ -1,0 +1,5 @@
+# LF в репозитории и рабочей копии: shell-скрипты должны работать на macOS.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+# Официальные фикстуры Shadowrocket хранятся байт-в-байт (тест round-trip).
+crates/fmt-shadowrocket/tests/fixtures/*.conf -text

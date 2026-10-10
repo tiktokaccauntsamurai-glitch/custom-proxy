@@ -1,0 +1,12 @@
+[package]
+name = "singbox-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log = "0.4"
+core-model = { path = "../core-model" }
+fmt-shadowrocket = { path = "../fmt-shadowrocket" }
+serde_json = { version = "1", features = ["preserve_order"] }
+fancy-regex = "0.14"
