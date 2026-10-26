@@ -1,6 +1,6 @@
 //! Узлы, которые не умеет официальный sing-box (транспорт `xhttp`), → второе ядро Xray-core.
 //!
-//! Схема (ARCHITECTURE.md §11): для каждого такого узла Xray слушает SOCKS5 на `127.0.0.1:<порт>`
+//! Схема (ARCHITECTURE.md §11; устройство Xray — §19): для каждого такого узла Xray слушает SOCKS5 на `127.0.0.1:<порт>`
 //! со случайным логином/паролем (на каждый запуск), а sing-box получает вместо узла outbound
 //! `socks` с тем же тегом. Группы, правила и fail-closed работают как с обычным узлом:
 //! если Xray упал, соединения через узел обрываются, а не идут DIRECT.
@@ -59,7 +59,13 @@ impl Config {
     }
 
     /// `log_level` — уровень cproxy (trace..error); Xray: debug|info|warning|error|none.
-    pub fn build(self, log_level: Option<&str>) -> Value {
+    /// `fwmark` — метка сокетов исходящих (Linux, kill switch: cli/src/killswitch.rs; `sockopt.mark`).
+    pub fn build(mut self, log_level: Option<&str>, fwmark: Option<u32>) -> Value {
+        if let Some(mark) = fwmark {
+            for o in self.outbounds.iter_mut() {
+                o["streamSettings"]["sockopt"]["mark"] = mark.into();
+            }
+        }
         let level = match log_level {
             Some("trace") | Some("debug") => "debug",
             Some("info") => "info",
@@ -123,8 +129,15 @@ fn outbound(p: &Proxy, warnings: &mut Vec<String>) -> Result<Value, String> {
     // `c.Xmux == (XmuxConfig{})`) — новое TLS-соединение на каждую сессию; на сервере пользователя
     // это давало ~50% зависаний по 19 с (отдельный xray: 11/20). `16-32` (прежнее значение Xray и Hiddify)
     // — 20/20. Явный xmux узла (в extra) не трогаем.
-    if xhttp["extra"].get("xmux").is_none() {
-        xhttp["xmux"] = json!({"maxConcurrency": "16-32"});
+    // `extra` целиком ЗАМЕНЯЕТ xhttpSettings (SplitHTTPConfig.Build: `c = &extra`, сверху остаются только
+    // host/path/mode), поэтому при наличии extra xmux кладём внутрь него (ARCHITECTURE.md §19.3).
+    let xmux = json!({"maxConcurrency": "16-32"});
+    match xhttp.get_mut("extra").and_then(Value::as_object_mut) {
+        Some(extra) if extra.contains_key("xmux") => log::debug!(target: "xray", "`{}`: xmux from extra kept", p.name),
+        Some(extra) => {
+            extra.insert("xmux".into(), xmux);
+        }
+        None => xhttp["xmux"] = xmux,
     }
     let mut stream = json!({"network": "xhttp", "xhttpSettings": xhttp});
     let sni = p.param(&["peer", "sni", "servername", "tls-host", "tls-name"]).or(host);

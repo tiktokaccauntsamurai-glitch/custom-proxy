@@ -124,6 +124,54 @@ impl Document {
     }
 }
 
+/// `[General] include = a.conf` (мануал, lazy.conf: «当前配置包含另一个配置 a.conf 的内容，当前配置的优先级高于 a.conf»):
+/// документ для генерации, в котором `base` важнее `inc`. Для записи не предназначен (lossless — у исходных
+/// документов). Вызывает `cli/src/main.rs::load`. Правила:
+/// - `[General]`: строки `inc` перед строками `base` — `general()` берёт последнее значение, поэтому побеждает base;
+/// - `[Rule]`: правила base, затем inc; FINAL из inc отбрасывается, если он есть в base;
+/// - `[Proxy]`, `[Proxy Group]`, `[Host]`: из inc — только имена/ключи, которых нет в base;
+/// - остальные секции — строки inc дописываются; секции, которых нет в base, — целиком.
+/// Строки inc помечаются комментарием `# include: <label>`; номера строк после него — уже не номера исходных файлов.
+pub fn merge_included(base: &Document, inc: &Document, label: &str) -> Document {
+    let mut out = base.clone();
+    let marker = format!("# include: {label}");
+    let name_of = |l: &str| l.split('=').next().unwrap_or("").trim().to_string();
+    for sec in &inc.sections {
+        let data: Vec<String> = sec.lines.iter().filter(|l| is_data(l)).cloned().collect();
+        let Some(target) = out.sections.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&sec.name)) else {
+            let mut lines = vec![marker.clone()];
+            lines.extend(sec.lines.iter().cloned());
+            out.sections.push(Section { name: sec.name.clone(), header_line: 0, lines });
+            continue;
+        };
+        let lower = sec.name.to_ascii_lowercase();
+        let added: Vec<String> = match lower.as_str() {
+            "general" => {
+                let mut lines = vec![marker.clone()];
+                lines.extend(data);
+                lines.append(&mut target.lines);
+                target.lines = lines;
+                continue;
+            }
+            "rule" => {
+                let base_final = target.lines.iter().any(|l| is_data(l) && l.trim().to_ascii_uppercase().starts_with("FINAL"));
+                data.into_iter().filter(|l| !(base_final && l.trim().to_ascii_uppercase().starts_with("FINAL"))).collect()
+            }
+            "proxy" | "proxy group" | "host" => {
+                let have: Vec<String> = target.lines.iter().filter(|l| is_data(l)).map(|l| name_of(l)).collect();
+                data.into_iter().filter(|l| !have.iter().any(|h| h.eq_ignore_ascii_case(&name_of(l)))).collect()
+            }
+            _ => data,
+        };
+        if !added.is_empty() {
+            target.lines.push(marker.clone());
+            target.lines.extend(added);
+        }
+    }
+    log::debug!(target: "conf", "include {label}: merged {} section(s)", inc.sections.len());
+    out
+}
+
 fn err(line: usize, message: &str) -> ParseError {
     ParseError { line, message: message.to_string() }
 }
@@ -270,6 +318,22 @@ mod tests {
     const SAMPLE: &str = "# my config\n[General]\nbypass-system = true\n\n[Proxy]\nHK = trojan, hk.example.com, 443, password=abc, peer=hk.example.com\nH = http, 1.2.3.4, 8080, user, pass\n\n[Proxy Group]\nPROXY = select, HK, DIRECT\nAuto = url-test, HK, url=http://www.gstatic.com/generate_204, interval=600\n\n[Rule]\n// ads\nDOMAIN-SUFFIX,ads.example.com,REJECT\nRULE-SET,https://example.com/a.list,PROXY\nGEOIP,CN,DIRECT,no-resolve\nAND,((PROTOCOL,UDP),(DST-PORT,443)),REJECT-NO-DROP\nFINAL,PROXY\n\n[MITM]\nhostname = *.example.com\n";
 
     #[test]
+    fn include_base_wins() {
+        let base = parse("[General]\ndns-server = 1.1.1.1\ninclude = a.conf\n[Proxy]\nA = trojan, a.example, 443, password=x\n[Rule]\nDOMAIN,a.com,DIRECT\nFINAL,PROXY\n");
+        let inc = parse("[General]\ndns-server = 8.8.8.8\nipv6 = false\n[Proxy]\nA = trojan, other.example, 443, password=y\nB = trojan, b.example, 443, password=z\n[Proxy Group]\nG = select, B\n[Rule]\nDOMAIN,b.com,G\nFINAL,DIRECT\n[MITM]\nhostname = *.x\n");
+        let m = merge_included(&base, &inc, "a.conf");
+        assert_eq!(m.general("dns-server").as_deref(), Some("1.1.1.1"), "base wins in [General]");
+        assert_eq!(m.general("ipv6").as_deref(), Some("false"), "new keys come from include");
+        let names: Vec<String> = m.proxies().unwrap().into_iter().map(|p| (p.name + "@" + &p.server)).collect();
+        assert_eq!(names, ["A@a.example", "B@b.example"], "base node kept, only new names added");
+        let rules: Vec<String> = m.data_lines("Rule").map(|(_, l)| l.to_string()).collect();
+        assert_eq!(rules, ["DOMAIN,a.com,DIRECT", "FINAL,PROXY", "DOMAIN,b.com,G"], "include FINAL dropped, base rules first");
+        assert_eq!(m.groups().unwrap()[0].name, "G");
+        assert!(m.section("MITM").is_some());
+        assert_eq!(write(&base), "[General]\ndns-server = 1.1.1.1\ninclude = a.conf\n[Proxy]\nA = trojan, a.example, 443, password=x\n[Rule]\nDOMAIN,a.com,DIRECT\nFINAL,PROXY\n", "base untouched");
+    }
+
+    #[test]
     fn round_trip_is_lossless() {
         assert_eq!(write(&parse(SAMPLE)), SAMPLE);
         let crlf = SAMPLE.replace('\n', "\r\n");
@@ -330,10 +394,10 @@ mod tests {
     /// Официальные примеры из LOWERTOP/Shadowrocket (см. tests/fixtures/README.md).
     #[test]
     fn official_fixtures() {
-        for name in ["lazy.conf", "lazy_group.conf"] {
-            let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-            let text = std::fs::read_to_string(&path).unwrap();
-            let doc = parse(&text);
+        // Встроены при сборке: тест не зависит от пути (кросс-сборка под Linux запускается в WSL).
+        let fixtures = [("lazy.conf", include_str!("../tests/fixtures/lazy.conf")), ("lazy_group.conf", include_str!("../tests/fixtures/lazy_group.conf"))];
+        for (name, text) in fixtures {
+            let doc = parse(text);
             assert_eq!(write(&doc), text, "{name}: round-trip");
             let rules = doc.rules().unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(rules.iter().any(|r| r.kind == "FINAL"), "{name}: FINAL");

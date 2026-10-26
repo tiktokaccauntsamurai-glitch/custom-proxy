@@ -331,3 +331,190 @@ always-real-ip = *
     assert!(!plain.config["inbounds"].as_array().unwrap().iter().any(|i| i["type"] == "tun"));
     real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &out.config);
 }
+
+fn home_server(users: &[(&str, server::Exit)]) -> server::Server {
+    server::Server {
+        listen: "::".into(),
+        port: 8443,
+        mask: "www.example.com".into(),
+        mask_port: 443,
+        private_key: "sLk8A5FO14fijkx48SgYIodNEF9Z8YJMwX1Gt5YH61s".into(),
+        short_ids: vec!["ce6f5e7f2c57d3be".into()],
+        users: users
+            .iter()
+            .map(|(n, e)| server::User { name: n.to_string(), uuid: "cc660c1a-f537-4846-890b-b160bedce606".into(), exit: *e })
+            .collect(),
+        block: vec!["203.0.113.9/32".into()],
+        clash_api: Some(("127.0.0.1:20999".into(), "s3cret".into())),
+    }
+}
+
+#[test]
+fn server_mode() {
+    use server::Exit::*;
+    fn port() -> u16 {
+        20888
+    }
+    let nodes = vec![
+        node("n#0", "X = vless, a.example, 443, password=bf000d23-0752-40b4-affe-68f7707a9661, tls=true, obfs=xhttp, path=/x"),
+        node("n#1", "T = trojan, t.example, 443, password=pw"),
+    ];
+    let srv = home_server(&[("iphone-ru", Direct), ("iphone-vps", Proxy), ("iphone-lan", Lan), ("ipad-ru", Direct)]);
+    let opts = Options { alloc_port: Some(port), ..Default::default() };
+    let out = server::generate(&srv, nodes.clone(), &opts).unwrap();
+    let c = &out.config;
+    assert_eq!(c["inbounds"].as_array().unwrap().len(), 1, "only the VLESS inbound, no mixed/tun");
+    let inb = &c["inbounds"][0];
+    assert_eq!((inb["type"].as_str(), inb["listen_port"].as_u64()), (Some("vless"), Some(8443)));
+    assert_eq!(inb["users"][0]["flow"], "xtls-rprx-vision");
+    assert_eq!(inb["tls"]["reality"]["handshake"]["server"], "www.example.com");
+    assert_eq!(redact(c)["inbounds"][0]["tls"]["reality"]["private_key"], "***");
+    assert_eq!(redact(c)["inbounds"][0]["users"][0]["uuid"], "***");
+    let rules = c["route"]["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), out.rule_origins.len());
+    let of = |user: &str| -> Vec<&Value> { rules.iter().filter(|r| r["auth_user"].as_array().is_some_and(|a| a.iter().any(|u| u == user))).collect() };
+    // ru: hijack-dns → resolve → запрет LAN/своего IP → DIRECT; у каждого пользователя свои правила (Clash API).
+    let ru = of("ipad-ru");
+    assert_eq!(ru.iter().map(|r| r["action"].as_str().unwrap()).collect::<Vec<_>>(), ["hijack-dns", "resolve", "reject", "route"]);
+    assert_eq!(ru[0]["auth_user"], json!(["ipad-ru"]));
+    assert_eq!(of("iphone-ru").len(), 4);
+    assert_eq!(c["experimental"]["clash_api"]["external_controller"], "127.0.0.1:20999");
+    assert_eq!(redact(c)["experimental"]["clash_api"]["secret"], "***");
+    assert_eq!(ru[2]["ip_is_private"], true);
+    assert!(ru[2]["ip_cidr"].as_array().unwrap().iter().any(|x| x == "203.0.113.9/32"));
+    assert_eq!(ru[3]["outbound"], "DIRECT");
+    // vps: без resolve (узел получает домен), запрет только IP-литералов.
+    let vps = of("iphone-vps");
+    assert_eq!(vps.iter().map(|r| r["action"].as_str().unwrap()).collect::<Vec<_>>(), ["reject", "route"]);
+    assert_eq!(vps[1]["outbound"], "PROXY");
+    // lan: loopback сервера закрыт, разрешена только домашняя сеть.
+    let lan = of("iphone-lan");
+    assert_eq!(lan[0]["ip_cidr"], json!(["127.0.0.0/8", "::1/128"]));
+    assert_eq!((lan[1]["ip_is_private"].as_bool(), lan[1]["outbound"].as_str()), (Some(true), Some("DIRECT")));
+    // Последнее правило — reject всего (fail-closed).
+    let last = rules.last().unwrap();
+    assert_eq!((last["action"].as_str(), last.get("auth_user")), (Some("reject"), None));
+    // PROXY = url-test из всех узлов; xhttp-узел через Xray.
+    let proxy = c["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == "PROXY").unwrap();
+    assert_eq!((proxy["type"].as_str(), proxy["outbounds"].clone()), (Some("urltest"), json!(["X", "T"])));
+    assert!(out.xray.is_some());
+    assert!(out.inbounds.is_empty(), "no system proxy in server mode");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], c);
+    real_check("xray", "CPROXY_XRAY", &["run", "-test", "-format", "json", "-c", "stdin:"], out.xray.as_ref().unwrap());
+
+    // Без узлов выход vps — reject с предупреждением; без vps-пользователей узлы не нужны вовсе.
+    let no_nodes = server::generate(&srv, vec![], &opts).unwrap();
+    let vps = no_nodes.config["route"]["rules"].as_array().unwrap().iter().filter(|r| r["auth_user"] == json!(["iphone-vps"])).last().unwrap().clone();
+    assert_eq!(vps["action"], "reject");
+    assert!(no_nodes.warnings.iter().any(|w| w.contains("vps")));
+    real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &no_nodes.config);
+    let ru_only = server::generate(&home_server(&[("p-ru", Direct)]), nodes, &opts).unwrap();
+    assert!(ru_only.xray.is_none());
+    assert_eq!(ru_only.config["outbounds"].as_array().unwrap().len(), 1, "only DIRECT");
+    real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &ru_only.config);
+}
+
+#[test]
+fn clash_api_and_saved_selection() {
+    let conf = CONF.replace("GEOIP,CN,DIRECT\n", "");
+    let mut opts = Options { clash_api: Some(("127.0.0.1:20998".into(), "sec".into())), ..Default::default() };
+    // Media = select, DIRECT, Japan, HK 1, policy-select-name=Japan → сохранённый выбор сильнее; чужой узел — игнор.
+    opts.selections.insert("Media".into(), "HK 1".into());
+    let out = generate(&fmt_shadowrocket::parse(&conf), &resources(), &opts).unwrap();
+    let ob = |t: &str| out.config["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == t).unwrap().clone();
+    assert_eq!(ob("Media")["default"], "HK 1");
+    let mut other = Options::default();
+    other.selections.insert("Media".into(), "NOPE".into());
+    let o2 = generate(&fmt_shadowrocket::parse(&conf), &resources(), &other).unwrap();
+    let media = o2.config["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == "Media").unwrap().clone();
+    assert_eq!(media["default"], "Japan", "selection of a non-member is ignored, policy-select-name stays");
+    assert_eq!(out.config["experimental"]["clash_api"]["external_controller"], "127.0.0.1:20998");
+    assert_eq!(redact(&out.config)["experimental"]["clash_api"]["secret"], "***");
+    real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &out.config);
+}
+
+#[test]
+fn fwmark_for_kill_switch() {
+    fn port() -> u16 {
+        20666
+    }
+    let nodes = vec![node("n#0", "X = vless, a.example, 443, password=bf000d23-0752-40b4-affe-68f7707a9661, tls=true, obfs=xhttp, path=/x")];
+    let opts = Options { nodes: Some(nodes), alloc_port: Some(port), fwmark: Some(0x2c70), ..Default::default() };
+    let out = generate(&fmt_shadowrocket::parse("[Rule]\nFINAL,PROXY\n"), &resources(), &opts).unwrap();
+    assert_eq!(out.config["route"]["default_mark"], 0x2c70);
+    let xr = out.xray.unwrap();
+    assert_eq!(xr["outbounds"][0]["streamSettings"]["sockopt"]["mark"], 0x2c70);
+    assert_eq!(xr["outbounds"][0]["streamSettings"]["network"], "xhttp", "mark does not replace stream settings");
+    // sing-box принимает default_mark только на Linux (route/network.go:79) — check только там.
+    if cfg!(target_os = "linux") {
+        real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &out.config);
+    }
+    real_check("xray", "CPROXY_XRAY", &["run", "-test", "-format", "json", "-c", "stdin:"], &xr);
+    let plain = generate(&fmt_shadowrocket::parse("[Rule]\nFINAL,DIRECT\n"), &resources(), &Options::default()).unwrap();
+    assert!(plain.config["route"].get("default_mark").is_none());
+}
+
+#[test]
+fn xmux_goes_into_extra() {
+    // `extra` заменяет весь xhttpSettings (ARCHITECTURE.md §19.3): xmux рядом с ним Xray выбросил бы.
+    fn port() -> u16 {
+        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20680);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+    let id = "password=bf000d23-0752-40b4-affe-68f7707a9661, tls=true, obfs=xhttp, path=/x";
+    let nodes = vec![
+        node("n#0", &format!(r#"A = vless, a.example, 443, {id}, xhttp-extra={{"noSSEHeader":true}}"#)),
+        node("n#1", &format!(r#"B = vless, b.example, 443, {id}, xhttp-extra={{"xmux":{{"maxConnections":"4"}}}}"#)),
+        node("n#2", &format!("C = vless, c.example, 443, {id}")),
+    ];
+    let opts = Options { nodes: Some(nodes), alloc_port: Some(port), ..Default::default() };
+    let out = generate(&fmt_shadowrocket::parse("[Rule]\nFINAL,PROXY\n"), &resources(), &opts).unwrap();
+    let xr = out.xray.unwrap();
+    let x = |i: usize| xr["outbounds"][i]["streamSettings"]["xhttpSettings"].clone();
+    assert_eq!(x(0)["extra"]["xmux"]["maxConcurrency"], "16-32", "default xmux inside extra");
+    assert_eq!(x(0)["extra"]["noSSEHeader"], true);
+    assert!(x(0).get("xmux").is_none(), "top-level xmux would be dropped by Xray");
+    assert_eq!(x(1)["extra"]["xmux"], json!({"maxConnections": "4"}), "node's own xmux kept");
+    assert!(x(1).get("xmux").is_none());
+    assert_eq!(x(2)["xmux"]["maxConcurrency"], "16-32", "no extra: top level");
+    real_check("xray", "CPROXY_XRAY", &["run", "-test", "-format", "json", "-c", "stdin:"], &xr);
+}
+
+#[test]
+fn block_quic_and_fallback_dns() {
+    let conf = "[General]\nblock-quic = all-proxy\ndns-server = https://doh.pub/dns-query\nfallback-dns-server = tls://1.1.1.1:853, system\n[Proxy]\nHK 1 = trojan, hk.example.com, 443, password=pw\n[Rule]\nDOMAIN-SUFFIX,direct.example,DIRECT\nDOMAIN-SUFFIX,proxy.example,PROXY\nDOMAIN-SUFFIX,ads.example,REJECT\nFINAL,PROXY\n";
+    let out = generate(&fmt_shadowrocket::parse(conf), &resources(), &Options::default()).unwrap();
+    let rules = out.config["route"]["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), out.rule_origins.len());
+    // fallback-dns: перед DIRECT-правилом — resolve с тем же условием.
+    let d = rules.iter().position(|r| r["domain_suffix"] == json!(["direct.example"]) && r["action"] == "route").unwrap();
+    assert_eq!(rules[d - 1], json!({"domain_suffix": ["direct.example"], "action": "resolve"}));
+    assert!(out.warnings.iter().any(|w| w.contains("fallback-dns-server")));
+    let twins: Vec<&Value> = rules.iter().filter(|r| r["type"] == "logical").collect();
+    assert_eq!(twins.len(), 1, "twin only for the PROXY rule, not DIRECT/REJECT: {rules:?}");
+    assert_eq!(twins[0]["rules"][0]["domain_suffix"], json!(["proxy.example"]));
+    assert_eq!(twins[0]["rules"][1], json!({"network": ["udp"], "port": [443]}));
+    assert!(twins[0]["rules"][0].get("action").is_none() && twins[0]["action"] == "reject");
+    // FINAL через прокси — UDP/443 в конце.
+    assert_eq!(rules.last().unwrap(), &json!({"network": ["udp"], "port": [443], "action": "reject"}));
+    // DNS: evaluate main (2 s) → respond NOERROR/NXDOMAIN → evaluate tls → respond → final = system.
+    let dns = &out.config["dns"];
+    let dr = dns["rules"].as_array().unwrap();
+    assert_eq!(dr[0], json!({"action": "evaluate", "server": "dns-main", "tag": "try-0", "timeout": "2s"}));
+    assert_eq!(dr[1]["match_response"], "try-0");
+    assert_eq!(dr[3]["server"], "dns-fallback-0");
+    assert_eq!(dns["final"], "dns-local");
+    real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &out.config);
+
+    // all — одно правило в начале; always-allow и неизвестное значение — ничего (неизвестное — warning).
+    let all = generate(&fmt_shadowrocket::parse(&conf.replace("all-proxy", "all")), &resources(), &Options::default()).unwrap();
+    let r = all.config["route"]["rules"].as_array().unwrap();
+    assert_eq!(r.iter().filter(|x| x["port"] == json!([443])).count(), 1);
+    assert!(!r.iter().any(|x| x["type"] == "logical"));
+    real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &all.config);
+    let off = generate(&fmt_shadowrocket::parse(&conf.replace("all-proxy", "always-allow")), &resources(), &Options::default()).unwrap();
+    assert!(!off.config["route"]["rules"].as_array().unwrap().iter().any(|x| x["port"] == json!([443]) || x["type"] == "logical"));
+    let bad = generate(&fmt_shadowrocket::parse(&conf.replace("all-proxy", "bogus")), &resources(), &Options::default()).unwrap();
+    assert!(bad.warnings.iter().any(|w| w.contains("block-quic")));
+}

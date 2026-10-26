@@ -1,6 +1,6 @@
 # cproxy
 
-A small, private, rule-based proxy for **Windows and macOS** that runs your **Shadowrocket (iOS) `.conf`** on a desktop.
+A small, private, rule-based proxy for **Windows, macOS and Linux** that runs your **Shadowrocket (iOS) `.conf`** on a desktop.
 
 cproxy is a command-line wrapper written in Rust. It does not implement network protocols itself. It translates your Shadowrocket rules into a configuration for the official [sing-box](https://github.com/SagerNet/sing-box) core and runs that core as a child process. Nodes that use the `xhttp` transport, which sing-box does not support, are handed to the official [Xray-core](https://github.com/XTLS/Xray-core).
 
@@ -9,7 +9,7 @@ apps ──► 127.0.0.1:7890 (HTTP + SOCKS5) ──► sing-box ──► rules
          or TUN (all system traffic)                         └──► Xray-core (xhttp nodes)
 ```
 
-> Status: `0.1.0-dev`. Tested on Windows 11. macOS is supported in the code but has not been tested yet.
+> Status: `0.1.0-dev`. Tested on Windows 11. Linux builds are tested on Ubuntu 24.04 (proxy mode); Linux TUN and the GNOME/KDE system proxy are not tested on real hardware yet. macOS is supported in the code but has not been tested yet.
 
 ---
 
@@ -46,11 +46,11 @@ apps ──► 127.0.0.1:7890 (HTTP + SOCKS5) ──► sing-box ──► rules
   - the `[Proxy]` section of a Shadowrocket `.conf`.
 - **Official cores only.** sing-box 1.14.3 and Xray-core 26.3.27, downloaded by scripts with pinned SHA256 hashes. No custom builds.
 - **Local HTTP + SOCKS5** on `127.0.0.1:7890` (one port for both protocols), or on the port from your `.conf`.
-- **System proxy** is switched on automatically while cproxy runs and is always restored afterwards (see [Modes](#modes-system-proxy-and-tun)).
+- **System proxy** is switched on automatically while cproxy runs and is always restored afterwards: Windows, macOS, and GNOME / KDE Plasma on Linux (see [Modes](#modes-system-proxy-and-tun)).
 - **TUN mode** captures all system traffic, including apps that ignore proxy settings. It uses fake-IP DNS, so nodes receive domain names, not IP addresses.
-- **Supervisor.** Restarts a crashed core and ties both cores to cproxy, so closing the window stops everything (Windows Job Object). `cproxy status` and `cproxy stop` work from another terminal.
+- **Supervisor.** Restarts a crashed core and ties both cores to cproxy, so closing the window stops everything (Windows Job Object, Linux `PR_SET_PDEATHSIG`). `cproxy status` and `cproxy stop` work from another terminal.
 - **Drag and drop.** Drop a `.conf` or a node file onto `cproxy.exe`: it is saved as rules or connection and started.
-- **Small.** One `cproxy` binary of about 3 MB plus the two cores.
+- **Small.** One `cproxy` binary of about 3 MB plus the two cores. On Linux it is a static musl binary that runs on any distribution.
 
 ## Privacy and security
 
@@ -65,10 +65,10 @@ apps ──► 127.0.0.1:7890 (HTTP + SOCKS5) ──► sing-box ──► rules
 
 ## Requirements
 
-- Windows 10/11 x64 or macOS (Intel / Apple Silicon).
+- Windows 10/11 x64, macOS (Intel / Apple Silicon) or Linux x86_64 / aarch64.
 - To build: a stable [Rust](https://rustup.rs) toolchain (edition 2021).
-- To fetch the cores: PowerShell (Windows) or `bash` + `curl` + `shasum` (macOS).
-- TUN mode: administrator rights (Windows asks via UAC) or `sudo` on macOS.
+- To fetch the cores: PowerShell (Windows) or `sh` + `curl` + `sha256sum`/`shasum` + `unzip`/`python3` (macOS, Linux).
+- TUN mode: administrator rights (Windows asks via UAC) or root (Linux and macOS ask for the `sudo` password).
 
 ## Build
 
@@ -80,11 +80,26 @@ cargo build --release -p cproxy   # -> target\release\cproxy.exe
 ```
 
 ```bash
-# macOS
+# macOS / Linux
 scripts/fetch-sing-box.sh
 scripts/fetch-xray.sh
 cargo build --release -p cproxy   # -> target/release/cproxy
 ```
+
+### Linux release archives
+
+`scripts/package-linux.sh` builds `dist/cproxy-<version>-linux-{x86_64,aarch64}.tar.gz`: a static `cproxy` plus the official `sing-box` and `xray` for that architecture, with a `.sha256` file next to each archive. Build `cproxy` for both targets first. From Windows this works through [zig](https://ziglang.org):
+
+```powershell
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+pip install ziglang
+cargo install cargo-zigbuild
+$env:CARGO_ZIGBUILD_ZIG_PATH = "<python site-packages>\ziglang\zig.exe"
+cargo zigbuild --release -p cproxy --target x86_64-unknown-linux-musl
+cargo zigbuild --release -p cproxy --target aarch64-unknown-linux-musl
+```
+
+Then run `sh scripts/package-linux.sh` on Linux or in WSL (`OUT_DIR=<dir>` puts the archives elsewhere). The fetch scripts accept `PLATFORM=Linux-aarch64` and `BIN_DIR=<dir>` to download cores for another platform.
 
 The fetch scripts download the official release archives from GitHub and stop if the SHA256 hash does not match the pinned value.
 
@@ -108,6 +123,8 @@ $env:HTTPS_PROXY = "http://127.0.0.1:7890"
 ```
 
 Stop it with Ctrl+C, by closing the window, or with `cproxy stop` from another terminal.
+
+On Linux, unpack the archive and run `./cproxy` from that folder; the cores are found next to it.
 
 You can also run a config once without saving anything:
 
@@ -149,11 +166,18 @@ This lets you use a public rule set (for example, one of the [LOWERTOP/Shadowroc
 
 **System proxy (default).** cproxy sets the OS proxy to `127.0.0.1:<port>` while it runs and restores the previous value on exit. Turn it off with `cproxy set system-proxy off` or `--no-system-proxy` for a single run.
 
+On Linux there is no single system proxy, so cproxy sets every one it finds:
+
+- **GNOME** and desktops built on it (Ubuntu, Fedora Workstation, Cinnamon, Budgie): `gsettings`, schema `org.gnome.system.proxy`. Requires a D-Bus session.
+- **KDE Plasma 5/6**: `kioslaverc` via `kwriteconfig`, then KIO is told to reload.
+
+On servers and other desktops cproxy prints a hint instead: use TUN, or `export HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890`. The proxy keeps running either way.
+
 cproxy warns at start-up if `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` in your environment point somewhere else, because such programs would bypass it.
 
 **TUN.** `cproxy run --tun` (or `cproxy set tun on`) creates a virtual network adapter and routes all system traffic through the rules.
 
-- Needs administrator rights. Without them, cproxy restarts itself through UAC with the same arguments.
+- Needs administrator rights. Without them, cproxy restarts itself with the same arguments: through UAC in a new window on Windows, through `sudo` in the same terminal on Linux and macOS. Under `sudo` it keeps using your settings and gives the data folder back to your user on exit. `cproxy stop` from your user asks for `sudo` to stop it.
 - DNS uses fake IPs from `198.18.0.0/15`, so sing-box knows the domain of every connection and nodes receive domains.
 - Some names always get real addresses: local names (`*.lan`, `*.local`, `*.home.arpa`), time servers, STUN and Windows connectivity checks. Add your own with `always-real-ip` in `[General]`; `always-real-ip = *` turns fake IPs off.
 - The system proxy is not touched while TUN is on.
@@ -246,7 +270,7 @@ Anything that cproxy reads but cannot execute is reported as a **warning** by `c
 - `IP-ASN` rules are not supported.
 - Subscriptions inside groups (`use=true`) are not supported yet; set the subscription as the `connection` instead.
 - When a connection reaches an IP-based rule (such as `GEOIP`), sing-box resolves the domain to check it and then sends the **IP** to sing-box-native nodes. `xhttp` nodes are not affected: Xray restores the domain from TLS SNI / HTTP Host.
-- macOS has not been tested yet.
+- macOS has not been tested yet. On Linux, TUN and the GNOME/KDE system proxy have not been tested on real hardware yet.
 
 ## Data locations
 
@@ -254,6 +278,7 @@ Anything that cproxy reads but cannot execute is reported as a **warning** by `c
 |---|---|
 | Windows | `%APPDATA%\cproxy` |
 | macOS | `~/Library/Application Support/cproxy` |
+| Linux | `$XDG_DATA_HOME/cproxy`, by default `~/.local/share/cproxy` |
 
 Override it with the `CPROXY_HOME` environment variable. It contains `settings.json`, `run.json` (the running instance), `sysproxy-backup.json` (only while the OS proxy is changed), the rule-list cache and `logs/`.
 
@@ -264,9 +289,9 @@ crates/core-model        data model: Rule, Matcher, Proxy, ProxyGroup
 crates/fmt-shadowrocket  lossless .conf parser and writer
 crates/fmt-nodes         node sources: share links, base64, Clash YAML, sing-box / Xray JSON
 crates/singbox-gen       .conf + nodes -> sing-box JSON (and an Xray config for xhttp nodes)
-crates/supervisor        starts, restarts and stops the cores (Job Object / signals)
+crates/supervisor        starts, restarts and stops the cores (Job Object / PDEATHSIG / signals)
 crates/cli               the `cproxy` binary: commands, settings, system proxy, TUN elevation, logging
-scripts/                 fetch the pinned sing-box and Xray releases with SHA256 checks
+scripts/                 fetch the pinned sing-box and Xray releases with SHA256 checks; package-linux.sh
 ```
 
 Code comments are in Russian.

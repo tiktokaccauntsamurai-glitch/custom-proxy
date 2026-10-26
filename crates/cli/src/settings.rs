@@ -7,6 +7,8 @@
 //! - `nodes` — кто управляет узлами: [`NodesMode`];
 //! - `system_proxy` — включать ли системный прокси ОС на время `run` (по умолчанию да, sysproxy.rs);
 //! - `tun` — режим TUN: весь трафик системы через правила (по умолчанию нет, нужны права администратора);
+//! - `selections` — выбор узлов в группах select (`cproxy select`), применяется при следующем запуске;
+//! - `kill_switch` — блок всего, кроме ядер, пока запущен cproxy (killswitch.rs, по умолчанию нет);
 //! - `debug` — полный лог (trace) в `<data>/logs` при каждом запуске (по умолчанию нет; main.rs::file_level).
 //! Читает/пишет `main.rs` (команды `set`, `status`, запуск без аргументов, перетаскивание файла).
 
@@ -59,11 +61,15 @@ pub struct Settings {
     pub system_proxy: bool,
     pub tun: bool,
     pub debug: bool,
+    /// Выбор в группах select (`cproxy select`): группа → узел. Применяется при генерации как `default`.
+    pub selections: std::collections::BTreeMap<String, String>,
+    /// Kill switch: пока запущен cproxy, в интернет ходят только ядра (killswitch.rs). По умолчанию выключен.
+    pub kill_switch: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { rules: None, connection: None, nodes: NodesMode::Auto, system_proxy: true, tun: false, debug: false }
+        Settings { rules: None, connection: None, nodes: NodesMode::Auto, system_proxy: true, tun: false, debug: false, selections: Default::default(), kill_switch: false }
     }
 }
 
@@ -93,6 +99,8 @@ impl Settings {
             system_proxy: v["system_proxy"].as_bool().unwrap_or(true),
             tun: v["tun"].as_bool().unwrap_or(false),
             debug: v["debug"].as_bool().unwrap_or(false),
+            kill_switch: v["kill_switch"].as_bool().unwrap_or(false),
+            selections: v["selections"].as_object().map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default(),
         };
         log::debug!(target: "settings", "loaded {}: rules={:?} connection={:?} nodes={} system_proxy={} tun={} debug={}", p.display(), me.rules, me.connection.as_deref().map(redact_source), me.nodes.name(), me.system_proxy, me.tun, me.debug);
         me
@@ -101,7 +109,7 @@ impl Settings {
     pub fn save(&self) -> Result<(), String> {
         let p = path();
         std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-        let v = json!({"rules": self.rules, "connection": self.connection, "nodes": self.nodes.name(), "system_proxy": self.system_proxy, "tun": self.tun, "debug": self.debug});
+        let v = json!({"rules": self.rules, "connection": self.connection, "nodes": self.nodes.name(), "system_proxy": self.system_proxy, "tun": self.tun, "debug": self.debug, "selections": self.selections, "kill_switch": self.kill_switch});
         std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).map_err(|e| format!("{}: {e}", p.display()))?;
         log::info!(target: "settings", "saved {}", p.display());
         Ok(())
@@ -114,6 +122,7 @@ impl Settings {
         println!("sys-proxy   {}", if self.system_proxy { "on (off while TUN is on)" } else { "off" });
         println!("tun         {}", if self.tun { "on" } else { "off" });
         println!("debug       {}", if self.debug { "on (full log in <data>/logs)" } else { "off" });
+        println!("kill-switch {}", if self.kill_switch { "on (only cores reach the internet while cproxy runs)" } else { "off" });
         println!("file        {}", path().display());
     }
 }

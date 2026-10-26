@@ -7,7 +7,7 @@
 //! восстанавливает домен — узлу уходит домен, а не IP. `[General] always-real-ip` (ключ Shadowrocket) —
 //! исключения; `*` = fake-ip выключен. Резолв для правил (`resolve`, direct) fake-ip не получает:
 //! `dns/router.go::Lookup` → `matchDNS(allowFakeIP=false)`.
-//! Фаза 3: `fallback-dns-server`, `hijack-dns` из [General].
+//! `fallback-dns-server` — цепочка evaluate/respond (см. `build`). Фаза 3: `hijack-dns` из [General].
 
 use std::collections::HashSet;
 
@@ -215,13 +215,53 @@ pub fn build(doc: &Document, outbounds: &HashSet<String>, warnings: &mut Vec<Str
         }
     }
 
+    // `[General] fallback-dns-server` (мануал: «当覆写 DNS 查询失败或查询时间超过 2 秒，Shadowrocket 会自动回退备用 DNS»):
+    // цепочка evaluate → respond (sing-box 1.14, `dns/router.go`, тест `TestDNSEvaluateParallelFallback`):
+    // спросить основной с таймаутом 2 с; есть ответ NOERROR/NXDOMAIN — отдать его (NXDOMAIN — не сбой);
+    // нет ответа (ошибка, таймаут, SERVFAIL) — следующий сервер; последний — обычный route.
+    // Правила идут после [Host] и fake-ip: запросы, пойманные ими, на fallback не попадают.
+    let fallback_specs: Vec<String> =
+        doc.general("fallback-dns-server").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let mut fallback_tags = Vec::new();
+    // Последний сервер цепочки — `dns.final` (правило без условий sing-box не принимает, как и в route).
+    let mut final_tag = MAIN.to_string();
+    for (i, spec) in fallback_specs.iter().enumerate() {
+        let tag = format!("dns-fallback-{i}");
+        match server(spec, &tag, outbounds) {
+            Ok(s) if s["type"] == "local" => fallback_tags.push(LOCAL.to_string()),
+            Ok(s) => {
+                servers.push(s);
+                fallback_tags.push(tag);
+            }
+            Err(e) => warnings.push(format!("fallback-dns-server `{spec}`: {e}; skipped")),
+        }
+    }
+    if !fallback_tags.is_empty() {
+        let mut chain = vec![MAIN.to_string()];
+        chain.extend(fallback_tags);
+        chain.dedup();
+        let last = chain.len() - 1;
+        for (i, tag) in chain.iter().enumerate() {
+            if i == last {
+                final_tag = tag.clone();
+                break;
+            }
+            let name = format!("try-{i}");
+            rules.push(json!({"action": "evaluate", "server": tag, "tag": name, "timeout": "2s"}));
+            for rcode in ["NOERROR", "NXDOMAIN"] {
+                rules.push(json!({"match_response": name, "response_rcode": rcode, "action": "respond"}));
+            }
+        }
+        log::debug!(target: "gen::dns", "fallback chain: {chain:?}");
+    }
+
     for s in &servers {
         log::debug!(target: "gen::dns", "server {}", crate::redact(s));
     }
     for r in &rules {
         log::debug!(target: "gen::dns", "rule {r}");
     }
-    let mut config = json!({"servers": servers, "rules": rules, "final": MAIN});
+    let mut config = json!({"servers": servers, "rules": rules, "final": final_tag});
     if doc.general("ipv6").is_some_and(|v| v.eq_ignore_ascii_case("false")) {
         config["strategy"] = "ipv4_only".into();
     } else if doc.general("prefer-ipv6").is_some_and(|v| v.eq_ignore_ascii_case("true")) {

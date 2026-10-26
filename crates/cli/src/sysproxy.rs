@@ -4,6 +4,7 @@
 //!   Chrome/Edge/Firefox-«системные настройки» и большинство программ) + `InternetSetOptionW`
 //!   (SETTINGS_CHANGED, REFRESH), чтобы программы подхватили изменение сразу. FFI без зависимостей.
 //! - macOS: `networksetup` для каждой включённой сетевой службы (web, secure web, SOCKS, bypass).
+//! - Linux: GNOME (`gsettings`) и KDE Plasma (`kwriteconfig`), см. `mod os` для linux.
 //!
 //! Откат (решение пользователя: включено по умолчанию, ARCHITECTURE.md §12):
 //! 1. снимок прежних значений → `<data>/sysproxy-backup.json` ДО изменения (переживает падение);
@@ -66,7 +67,9 @@ pub fn bypass_list(skip_proxy: Option<&str>) -> Vec<String> {
 
 /// Включает системный прокси. Снимок пишется в файл до изменения.
 pub fn enable(t: &Target, bypass: &[String], warnings: &mut Vec<String>) -> Result<(), String> {
-    let snap = os::snapshot()?;
+    // Подсказки ОС ссылаются на `<port>` (Linux без поддерживаемого стола): подставить наш.
+    let port = t.http.as_ref().or(t.socks.as_ref()).map(|(_, p)| p.to_string()).unwrap_or_default();
+    let snap = os::snapshot().map_err(|e| e.replace("<port>", &port))?;
     std::fs::write(backup_path(), serde_json::to_string_pretty(&snap).unwrap()).map_err(|e| format!("cannot save system proxy backup: {e}"))?;
     log::debug!(target: "sysproxy", "snapshot saved to {}: {snap}", backup_path().display());
     *SNAPSHOT.lock().unwrap() = Some(snap);
@@ -165,6 +168,7 @@ pub fn install_close_handler() {
 
 /// IPv4 CIDR → маски WinINet (`192.168.*`). Не по границе байта — разворачивается (/12 → 16 масок).
 /// `None` — не IPv4 CIDR (оставить как есть); `Some(vec![])` — не переводится (IPv6, слишком широкий).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn cidr_to_wildcards(entry: &str) -> Option<Vec<String>> {
     let (ip, bits) = entry.split_once('/')?;
     let bits: u32 = bits.parse().ok()?;
@@ -375,6 +379,9 @@ mod os {
         if matches!(ctrl, 2 | 5 | 6) {
             log::warn!(target: "sysproxy", "console event {ctrl} (window closed / logoff / shutdown): restoring system proxy");
             super::restore();
+            // Закрытие окна — штатный выход: ядра гибнут вместе с окном (Job Object), защиту тоже снять,
+            // иначе без интернета до следующего запуска (killswitch.rs).
+            crate::killswitch::disable();
             log::logger().flush();
         }
         0
@@ -488,15 +495,183 @@ mod os {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+mod os {
+    //! Единого системного прокси в Linux нет: каждый рабочий стол хранит свой.
+    //! - GNOME (и Ubuntu, Cinnamon, Budgie, Pantheon): `gsettings` схемы `org.gnome.system.proxy`.
+    //!   Его же читают Chrome/Firefox на этих столах. Снимок — значения в формате GVariant, как их
+    //!   печатает `gsettings get`; `gsettings set` принимает их обратно без преобразований.
+    //! - KDE Plasma 5/6: `kioslaverc`, группа `Proxy Settings` через `kreadconfig{6,5}`/`kwriteconfig{6,5}`,
+    //!   затем сигнал D-Bus `org.kde.KIO.Scheduler.reparseSlaveConfiguration`, чтобы KIO перечитал файл.
+    //! Включаются все найденные. Нет ни одного (сервер, другой стол, `sudo` без сессии D-Bus) —
+    //! ошибка с подсказкой; `run` её только логирует (main.rs::enable_system_proxy).
+    use super::Target;
+    use serde_json::{json, Map, Value};
+    use std::process::Command;
+
+    const GNOME: &str = "org.gnome.system.proxy";
+    /// (подсхема, ключ) — всё, что меняем в GNOME и потому сохраняем в снимке.
+    const GNOME_KEYS: [(&str, &str); 8] = [
+        ("", "mode"),
+        ("", "ignore-hosts"),
+        (".http", "host"),
+        (".http", "port"),
+        (".https", "host"),
+        (".https", "port"),
+        (".socks", "host"),
+        (".socks", "port"),
+    ];
+    const KDE_KEYS: [&str; 5] = ["ProxyType", "httpProxy", "httpsProxy", "socksProxy", "NoProxyFor"];
+
+    fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
+        let out = Command::new(cmd).args(args).output().map_err(|e| format!("{cmd}: {e}"))?;
+        log::trace!(target: "sysproxy", "{cmd} {} → {}", args.join(" "), out.status);
+        if !out.status.success() {
+            return Err(format!("{cmd} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// GNOME доступен: есть `gsettings`, схема установлена и есть сессия D-Bus (иначе gsettings
+    /// молча пишет в memory-backend, и изменение никуда не попадает).
+    fn has_gnome() -> bool {
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() && run("gsettings", &["get", GNOME, "mode"]).is_ok()
+    }
+
+    /// KDE: стол Plasma и найден `kwriteconfig6` или `kwriteconfig5`. Возвращает (чтение, запись).
+    fn kde_tools() -> Option<(&'static str, &'static str)> {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        if !desktop.split(':').any(|d| d.eq_ignore_ascii_case("KDE")) {
+            return None;
+        }
+        [("kreadconfig6", "kwriteconfig6"), ("kreadconfig5", "kwriteconfig5")]
+            .into_iter()
+            .find(|(_, w)| Command::new(w).arg("--help").output().is_ok_and(|o| o.status.success()))
+    }
+
+    fn kde_read(tool: &str, key: &str) -> Result<String, String> {
+        run(tool, &["--file", "kioslaverc", "--group", "Proxy Settings", "--key", key])
+    }
+
+    /// Пустое значение — ключа не было: при откате его удаляем, а не пишем пустую строку.
+    fn kde_write(tool: &str, key: &str, value: &str) -> Result<(), String> {
+        let mut args = vec!["--file", "kioslaverc", "--group", "Proxy Settings", "--key", key];
+        if value.is_empty() {
+            args.push("--delete");
+        } else {
+            args.push(value);
+        }
+        run(tool, &args).map(drop)
+    }
+
+    fn kde_notify() {
+        // Без сигнала уже запущенные программы KDE не заметят изменения до перезапуска.
+        let _ = run("dbus-send", &["--type=signal", "/KIO/Scheduler", "org.kde.KIO.Scheduler.reparseSlaveConfiguration", "string:"]);
+    }
+
+    /// Строка GVariant `['a', 'b']` для `ignore-hosts`.
+    pub fn gvariant_list(items: &[String]) -> String {
+        let quoted: Vec<String> = items.iter().map(|s| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))).collect();
+        format!("[{}]", quoted.join(", "))
+    }
+
+    /// Значения KDE для нашего прокси: адрес в формате `http://host port` (так пишет сама Plasma).
+    pub fn kde_values(t: &Target, bypass: &[String]) -> Vec<(&'static str, String)> {
+        let addr = |scheme: &str, a: &Option<(String, u16)>| a.as_ref().map(|(h, p)| format!("{scheme}://{h} {p}")).unwrap_or_default();
+        vec![
+            ("ProxyType", "1".into()),
+            ("httpProxy", addr("http", &t.http)),
+            ("httpsProxy", addr("http", &t.http)),
+            ("socksProxy", addr("socks", &t.socks)),
+            ("NoProxyFor", bypass.join(",")),
+        ]
+    }
+
+    const UNSUPPORTED: &str = "no supported desktop found for the system proxy (GNOME via gsettings, KDE Plasma via kwriteconfig). \
+        Use TUN (`cproxy run --tun`) or point programs at the proxy: export HTTP_PROXY=http://127.0.0.1:<port> HTTPS_PROXY=http://127.0.0.1:<port>";
+
+    pub fn snapshot() -> Result<Value, String> {
+        let mut snap = Map::new();
+        snap.insert("os".into(), "linux".into());
+        if has_gnome() {
+            let mut g = Map::new();
+            for (sub, key) in GNOME_KEYS {
+                g.insert(format!("{sub}:{key}"), run("gsettings", &["get", &format!("{GNOME}{sub}"), key])?.into());
+            }
+            snap.insert("gnome".into(), g.into());
+        }
+        if let Some((read, _)) = kde_tools() {
+            let mut k = Map::new();
+            for key in KDE_KEYS {
+                k.insert(key.into(), kde_read(read, key)?.into());
+            }
+            snap.insert("kde".into(), json!({"tool": read, "values": k}));
+        }
+        if !snap.contains_key("gnome") && !snap.contains_key("kde") {
+            return Err(UNSUPPORTED.into());
+        }
+        Ok(snap.into())
+    }
+
+    pub fn apply(t: &Target, bypass: &[String], _warnings: &mut Vec<String>) -> Result<(), String> {
+        let mut done = false;
+        if has_gnome() {
+            let set = |sub: &str, key: &str, v: &str| run("gsettings", &["set", &format!("{GNOME}{sub}"), key, v]).map(drop);
+            // GNOME понимает CIDR и `*.domain` в ignore-hosts как есть.
+            set("", "ignore-hosts", &gvariant_list(bypass))?;
+            for (sub, a) in [(".http", &t.http), (".https", &t.http), (".socks", &t.socks)] {
+                let (host, port) = a.as_ref().map(|(h, p)| (h.clone(), *p)).unwrap_or_default();
+                set(sub, "host", &format!("'{host}'"))?;
+                set(sub, "port", &port.to_string())?;
+            }
+            set("", "mode", "'manual'")?;
+            done = true;
+        }
+        if let Some((_, write)) = kde_tools() {
+            for (key, value) in kde_values(t, bypass) {
+                kde_write(write, key, &value)?;
+            }
+            kde_notify();
+            done = true;
+        }
+        if done { Ok(()) } else { Err(UNSUPPORTED.into()) }
+    }
+
+    pub fn restore(snap: &Value) -> Result<(), String> {
+        if let Some(g) = snap["gnome"].as_object() {
+            // mode последним: сначала вернуть адреса, потом включить прежний режим.
+            let mut keys: Vec<(&String, &Value)> = g.iter().collect();
+            keys.sort_by_key(|(k, _)| k.as_str() == ":mode");
+            for (k, v) in keys {
+                let (sub, key) = k.split_once(':').unwrap_or(("", k));
+                run("gsettings", &["set", &format!("{GNOME}{sub}"), key, v.as_str().unwrap_or("")])?;
+            }
+        }
+        if let Some(values) = snap["kde"]["values"].as_object() {
+            let read = snap["kde"]["tool"].as_str().unwrap_or("kreadconfig5");
+            let write = read.replace("kread", "kwrite");
+            for (k, v) in values {
+                kde_write(&write, k, v.as_str().unwrap_or(""))?;
+            }
+            kde_notify();
+        }
+        Ok(())
+    }
+
+    pub fn install_close_handler() {
+        // Закрытие терминала шлёт SIGHUP — ловит ctrlc с feature `termination` (Cargo.toml).
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod os {
     use super::Target;
     use serde_json::Value;
     pub fn snapshot() -> Result<Value, String> {
-        Err("system proxy is supported on Windows and macOS only".into())
+        Err("system proxy is supported on Windows, macOS and Linux (GNOME, KDE) only".into())
     }
     pub fn apply(_: &Target, _: &[String], _: &mut Vec<String>) -> Result<(), String> {
-        Err("system proxy is supported on Windows and macOS only".into())
+        Err("system proxy is supported on Windows, macOS and Linux (GNOME, KDE) only".into())
     }
     pub fn restore(_: &Value) -> Result<(), String> {
         Ok(())
@@ -547,5 +722,18 @@ mod tests {
             v("all_proxy", ""),
         ];
         assert_eq!(foreign_env_proxies(&t, &vars), [vars[0].clone(), vars[4].clone()]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_values() {
+        let b = bypass_list(Some("*.local, it's"));
+        assert_eq!(os::gvariant_list(&b), r"['*.local', 'it\'s', 'localhost', '127.0.0.0/8']");
+        let t = Target::from_inbounds(&[("mixed".into(), "127.0.0.1".into(), 7890)]).unwrap();
+        let kv = os::kde_values(&t, &b);
+        assert_eq!(kv[0], ("ProxyType", "1".to_string()));
+        assert_eq!(kv[1].1, "http://127.0.0.1 7890");
+        assert_eq!(kv[3].1, "socks://127.0.0.1 7890");
+        assert_eq!(kv[4].1, "*.local,it's,localhost,127.0.0.0/8");
     }
 }

@@ -13,12 +13,15 @@
 //! - `dns.rs`      → `dns`                          (sing-box `dns/router.go`, `dns/transport`)
 //! - `xray.rs`     → `Output::xray` (конфиг второго ядра для xhttp, ARCHITECTURE.md §11)
 //! - `tun_inbound` → `inbounds[tun]` + `route.auto_detect_interface` (sing-box `protocol/tun`, §14)
+//! - `server.rs`   → режим сервера: вход VLESS REALITY + правила `auth_user` (docs/SERVER-MODE.md)
+//! - `Options::clash_api` → `experimental.clash_api` (cli/src/clash.rs: groups/select/test, server status)
 //! - `generate`    собирает всё + `inbounds[mixed]`, `log`, `route.final`.
 //! Вызывается из `cli/src/main.rs::build`; ресурсы даёт `cli/src/store.rs::Cache`.
 
 mod dns;
 mod outbound;
 mod rules;
+pub mod server;
 mod xray;
 
 use std::collections::HashSet;
@@ -59,6 +62,13 @@ pub struct Options {
     /// Доп. исключения из TUN (CIDR): адреса серверов Xray-узлов, разрешённые cli до запуска —
     /// Xray ходит к ним мимо TUN напрямую (ARCHITECTURE.md §14).
     pub tun_exclude: Vec<String>,
+    /// Clash API (`experimental.clash_api`): (127.0.0.1:порт, secret) — cli/src/clash.rs. `None` — выключен.
+    pub clash_api: Option<(String, String)>,
+    /// Сохранённый выбор в группах select (`cproxy select`): группа → узел. Сильнее `policy-select-name`.
+    pub selections: std::collections::BTreeMap<String, String>,
+    /// Метка сокетов ядер (Linux, kill switch: `route.default_mark`, Xray `sockopt.mark`). sing-box принимает
+    /// её только на Linux (`route/network.go:79`).
+    pub fwmark: Option<u32>,
 }
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1";
@@ -190,6 +200,43 @@ impl Ctx {
             }
         }
     }
+}
+
+/// `[General] block-quic` (мануал, lazy.conf): `all-proxy` — QUIC (UDP/443) режется только у соединений через
+/// прокси, `all` — у всех, `always-allow` — не режется. Нет ключа — не режем (поведение по умолчанию в мануале
+/// не описано; так было до поддержки ключа).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockQuic {
+    None,
+    AllProxy,
+    All,
+}
+
+impl BlockQuic {
+    fn from_doc(doc: &Document, warnings: &mut Vec<String>) -> Self {
+        match doc.general("block-quic").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("always-allow") | Some("") => Self::None,
+            Some("all-proxy") => Self::AllProxy,
+            Some("all") => Self::All,
+            Some(other) => {
+                warnings.push(format!("[General] block-quic = {other}: expected all-proxy|all|always-allow; ignored"));
+                Self::None
+            }
+        }
+    }
+}
+
+/// Правило-двойник для `block-quic = all-proxy`: то же условие И UDP/443 → reject. Только для правил, ведущих
+/// не в DIRECT (группа считается прокси, даже если сейчас выбран DIRECT — выбор известен лишь sing-box).
+fn quic_twin(rule: &Value) -> Option<Value> {
+    if rule["action"] != "route" || rule["outbound"] == "DIRECT" {
+        return None;
+    }
+    let mut cond = rule.clone();
+    let obj = cond.as_object_mut()?;
+    obj.remove("action");
+    obj.remove("outbound");
+    Some(json!({"type": "logical", "mode": "and", "rules": [cond, {"network": ["udp"], "port": [443]}], "action": "reject"}))
 }
 
 fn merge(mut cond: Value, action: &Value) -> Value {
@@ -360,7 +407,11 @@ pub fn generate(doc: &Document, res: &dyn Resources, opts: &Options) -> Result<O
         }
     }
     for (g, members) in &groups {
-        let v = group_json(g, members, &mut warnings);
+        let mut v = group_json(g, members, &mut warnings);
+        if let Some(sel) = opts.selections.get(&g.name).filter(|n| v["type"] == "selector" && members.contains(n)) {
+            log::debug!(target: "gen::group", "`{}`: saved selection `{sel}` (cproxy select)", g.name);
+            v["default"] = sel.clone().into();
+        }
         log::trace!(target: "gen::group", "`{}` → {v}", g.name);
         outbounds.push(v);
     }
@@ -413,15 +464,57 @@ pub fn generate(doc: &Document, res: &dyn Resources, opts: &Options) -> Result<O
     }
     // Один `resolve` перед первым IP-правилом без no-resolve: домен в Destination сохраняется
     // (route.go::actionResolve), поэтому прокси-узлы по-прежнему резолвят удалённо.
+    let quic = BlockQuic::from_doc(doc, &mut ctx.warnings);
+    if quic == BlockQuic::All {
+        route_rules.push(json!({"network": ["udp"], "port": [443], "action": "reject"}));
+        rule_origins.push("(cproxy) [General] block-quic = all: UDP/443 → REJECT".into());
+    }
+    // fallback-dns-server действует только на запросы через DNS-правила (dns.rs). DIRECT резолвит домен сам через
+    // `default_domain_resolver` — мимо правил (sing-box `common/dialer/dialer.go::NewDNSQueryOptions`), а без него
+    // 1.14 не работает (deprecated `missing-domain-resolver`). Поэтому перед DIRECT-правилами — `resolve` с тем же
+    // условием: `route.go::actionResolve` идёт через `Lookup` с правилами, DIRECT дальше берёт готовые адреса.
+    // Прокси-правилам resolve не добавляем: узел должен получить домен (§8).
+    let fallback_dns = doc.general("fallback-dns-server").is_some_and(|v| !v.trim().is_empty());
+    if fallback_dns {
+        ctx.warnings.push("fallback-dns-server: used for DNS queries of programs (TUN) and DIRECT connections; domains of proxy servers themselves are resolved by dns-server only".into());
+    }
     let mut resolved = false;
     for (rule, needs_ip, origin) in explicit.into_iter().chain(late) {
+        if fallback_dns && !needs_ip && rule["action"] == "route" && rule["outbound"] == "DIRECT" {
+            let mut cond = rule.clone();
+            if let Some(o) = cond.as_object_mut() {
+                o.remove("outbound");
+                o.insert("action".into(), "resolve".into());
+            }
+            route_rules.push(cond);
+            rule_origins.push(format!("(cproxy) fallback-dns-server: resolve via DNS rules before DIRECT — {origin}"));
+        }
         if needs_ip && !resolved {
             route_rules.push(json!({"action": "resolve"}));
             rule_origins.push(format!("(cproxy) resolve before first IP rule — {origin}"));
             resolved = true;
         }
+        if quic == BlockQuic::AllProxy {
+            if let Some(twin) = quic_twin(&rule) {
+                route_rules.push(twin);
+                rule_origins.push(format!("(cproxy) block-quic = all-proxy: UDP/443 of — {origin}"));
+            }
+        }
         route_rules.push(rule);
         rule_origins.push(origin);
+    }
+    // all-proxy и FINAL через прокси: то, что дошло до конца, уйдёт в final — QUIC отсечь здесь.
+    let final_proxied = matches!(&final_action, Some(a) if a["action"] == "route" && a["outbound"] != "DIRECT")
+        || (final_action.is_none() && ctx.tags.contains("PROXY"));
+    let final_direct = matches!(&final_action, Some(a) if a["action"] == "route" && a["outbound"] == "DIRECT")
+        || (final_action.is_none() && !ctx.tags.contains("PROXY"));
+    if fallback_dns && final_direct {
+        route_rules.push(merge(serde_json::from_str(MATCH_ALL).unwrap(), &json!({"action": "resolve"})));
+        rule_origins.push("(cproxy) fallback-dns-server: resolve via DNS rules before FINAL (DIRECT)".into());
+    }
+    if quic == BlockQuic::AllProxy && final_proxied {
+        route_rules.push(json!({"network": ["udp"], "port": [443], "action": "reject"}));
+        rule_origins.push("(cproxy) block-quic = all-proxy: UDP/443 before FINAL (proxy)".into());
     }
     let final_tag = match final_action {
         Some(a) if a["action"] == "route" => a["outbound"].as_str().unwrap().to_string(),
@@ -455,6 +548,10 @@ pub fn generate(doc: &Document, res: &dyn Resources, opts: &Options) -> Result<O
         // Исходящие соединения sing-box привязываются к физическому интерфейсу, а не к своему TUN.
         route.insert("auto_detect_interface".into(), true.into());
     }
+    if let Some(mark) = opts.fwmark {
+        // Конфликтует только с tun.auto_redirect (common/dialer/default.go:261), его не используем.
+        route.insert("default_mark".into(), mark.into());
+    }
 
     // Логи sing-box идут в stderr без метки времени: cli ставит свою и пишет в общий файл.
     let log = match &opts.log_level {
@@ -477,11 +574,14 @@ pub fn generate(doc: &Document, res: &dyn Resources, opts: &Options) -> Result<O
     if !endpoints.is_empty() {
         config["endpoints"] = endpoints.into();
     }
+    if let Some((addr, secret)) = &opts.clash_api {
+        config["experimental"] = json!({"clash_api": {"external_controller": addr, "secret": secret}});
+    }
     for w in &ctx.warnings {
         log::warn!(target: "gen", "{w}");
     }
     log::debug!(target: "gen", "done: {} outbounds, {} route rules, {} warnings", config["outbounds"].as_array().map_or(0, Vec::len), rule_origins.len(), ctx.warnings.len());
-    let xray = (!xray_cfg.is_empty()).then(|| xray_cfg.build(opts.log_level.as_deref()));
+    let xray = (!xray_cfg.is_empty()).then(|| xray_cfg.build(opts.log_level.as_deref(), opts.fwmark));
     if let Some(x) = &xray {
         log::trace!(target: "gen::xray", "xray config (secrets redacted): {}", redact(x));
     }

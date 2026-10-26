@@ -1,5 +1,30 @@
-//! Платформенные примитивы супервизора: Job Object (Windows), проверка/имя/убийство процесса по PID,
-//! сигнал остановки от `cproxy stop` (Windows — именованное событие, Unix — SIGTERM).
+//! Платформенные примитивы супервизора: Job Object (Windows), PDEATHSIG (Linux), проверка/имя/убийство
+//! процесса по PID, сигнал остановки от `cproxy stop` (Windows — именованное событие, Unix — SIGTERM).
+
+/// Ядро гибнет вместе с cproxy. Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` в дочернем процессе до exec
+/// (аналог Job Object; Windows — `kill_children_on_exit`). Сигнал приходит при смерти *потока*,
+/// создавшего процесс, поэтому ядра запускаются только из главного потока (main.rs::run, Supervisor).
+#[cfg(target_os = "linux")]
+pub fn tie_to_parent(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    extern "C" {
+        fn prctl(option: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+    }
+    const PR_SET_PDEATHSIG: std::os::raw::c_int = 1;
+    const SIGKILL: std::os::raw::c_ulong = 9;
+    // SAFETY: между fork и exec вызывается только async-signal-safe `prctl`, без аллокаций.
+    unsafe {
+        cmd.pre_exec(|| {
+            if prctl(PR_SET_PDEATHSIG, SIGKILL) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn tie_to_parent(_cmd: &mut std::process::Command) {}
 
 #[cfg(windows)]
 mod imp {
@@ -172,6 +197,9 @@ mod imp {
     use std::process::{Command, Stdio};
 
     pub fn kill_children_on_exit() -> Result<(), String> {
+        if cfg!(target_os = "linux") {
+            return Err("Linux: cores get PDEATHSIG instead (os::tie_to_parent)".into());
+        }
         Err("not available on this OS (stale cores are cleaned up on next start)".into())
     }
 
@@ -179,8 +207,9 @@ mod imp {
         cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
     }
 
+    /// `ps`, а не `kill -0`: процесс root (TUN под sudo) для `kill -0` от пользователя — EPERM.
     pub fn alive(pid: u32) -> bool {
-        quiet(Command::new("kill").args(["-0", &pid.to_string()]))
+        quiet(Command::new("ps").args(["-p", &pid.to_string(), "-o", "pid="]))
     }
 
     pub fn name(pid: u32) -> Option<String> {
@@ -205,7 +234,12 @@ mod imp {
     }
 
     pub fn request_stop(pid: u32) -> Result<(), String> {
-        if quiet(Command::new("kill").args(["-TERM", &pid.to_string()])) { Ok(()) } else { Err(format!("kill -TERM {pid} failed")) }
+        if quiet(Command::new("kill").args(["-TERM", &pid.to_string()])) {
+            return Ok(());
+        }
+        // Экземпляр с TUN работает под root (elevate.rs): повторить через sudo, пароль спросит терминал.
+        let ok = Command::new("sudo").args(["kill", "-TERM", &pid.to_string()]).status().is_ok_and(|s| s.success());
+        if ok { Ok(()) } else { Err(format!("kill -TERM {pid} failed (also with sudo)")) }
     }
 }
 

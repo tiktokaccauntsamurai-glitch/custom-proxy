@@ -2,7 +2,8 @@
 //!
 //! Пишут в него все крейты через `log::*!` (targets: `cli`, `fetch`, `conf`, `gen::*`) и
 //! `main.rs::pump_sing_box_log` — строки sing-box с target `sing-box` (ARCHITECTURE.md §10).
-//! Файл: `<data>/logs/cproxy-YYYYMMDD-HHMMSS-<cmd>.log`, хранятся последние `KEEP` файлов.
+//! Файл: `<data>/logs/cproxy-YYYYMMDD-HHMMSS-<cmd>.log`, хранятся последние `KEEP` файлов. Файл больше
+//! `MAX_FILE` — продолжение в новом файле (сервер с trace работает неделями: KEEP × MAX_FILE — потолок на диске).
 //! По умолчанию логи выключены (приватность); trace включают `--debug` или `set debug on` (main.rs::file_level).
 
 use std::fs::File;
@@ -14,9 +15,52 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 const KEEP: usize = 20;
+const MAX_FILE: u64 = 32 << 20;
+
+struct Sink {
+    file: File,
+    written: u64,
+    dir: PathBuf,
+    cmd: String,
+}
+
+impl Sink {
+    fn write(&mut self, line: &str) {
+        if self.written >= MAX_FILE {
+            if let Some((f, _)) = create(&self.dir, &self.cmd) {
+                let _ = self.file.flush();
+                self.file = f;
+                self.written = 0;
+            }
+        }
+        if self.file.write_all(line.as_bytes()).is_ok() {
+            self.written += line.len() as u64;
+        }
+    }
+}
+
+/// Новый файл лога (старые сверх `KEEP` удаляются).
+fn create(dir: &Path, cmd: &str) -> Option<(File, PathBuf)> {
+    rotate(dir);
+    let stamp: String = utc(SystemTime::now()).chars().filter(|c| c.is_ascii_digit()).take(14).collect();
+    let mut p = dir.join(format!("cproxy-{}-{}-{cmd}.log", &stamp[..8], &stamp[8..]));
+    // Продолжение в ту же секунду — не затирать только что закрытый файл.
+    let mut n = 2;
+    while p.exists() {
+        p = dir.join(format!("cproxy-{}-{}-{cmd}-{n}.log", &stamp[..8], &stamp[8..]));
+        n += 1;
+    }
+    match File::create(&p) {
+        Ok(f) => Some((f, p)),
+        Err(e) => {
+            eprintln!("warning: cannot create log file {}: {e}", p.display());
+            None
+        }
+    }
+}
 
 struct Logger {
-    file: Option<Mutex<File>>,
+    file: Option<Mutex<Sink>>,
     file_level: LevelFilter,
     console_level: LevelFilter,
 }
@@ -32,7 +76,7 @@ impl Log for Logger {
             if level <= self.file_level {
                 let line = format!("{} {:<5} [{target}] {}\n", utc(SystemTime::now()), level, r.args());
                 if let Ok(mut f) = file.lock() {
-                    let _ = f.write_all(line.as_bytes());
+                    f.write(&line);
                 }
             }
         }
@@ -50,7 +94,7 @@ impl Log for Logger {
 
     fn flush(&self) {
         if let Some(Ok(mut f)) = self.file.as_ref().map(Mutex::lock) {
-            let _ = f.flush();
+            let _ = f.file.flush();
         }
     }
 }
@@ -60,15 +104,9 @@ pub fn init(dir: &Path, cmd: &str, file_level: LevelFilter, console_level: Level
     let mut path = None;
     let mut file = None;
     if file_level != LevelFilter::Off && std::fs::create_dir_all(dir).is_ok() {
-        rotate(dir);
-        let stamp: String = utc(SystemTime::now()).chars().filter(|c| c.is_ascii_digit()).take(14).collect();
-        let p = dir.join(format!("cproxy-{}-{}-{cmd}.log", &stamp[..8], &stamp[8..]));
-        match File::create(&p) {
-            Ok(f) => {
-                file = Some(Mutex::new(f));
-                path = Some(p);
-            }
-            Err(e) => eprintln!("warning: cannot create log file {}: {e}", p.display()),
+        if let Some((f, p)) = create(dir, cmd) {
+            file = Some(Mutex::new(Sink { file: f, written: 0, dir: dir.to_path_buf(), cmd: cmd.to_string() }));
+            path = Some(p);
         }
     }
     let max = file_level.max(console_level);
