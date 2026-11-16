@@ -77,19 +77,74 @@ impl Exit {
 pub struct User {
     /// Имя в логе sing-box и в `auth_user`: `<устройство>-<выход>`.
     pub name: String,
-    pub uuid: String,
+    /// Учётные данные пользователя во входе: UUID для VLESS, пароль/ключ для будущих типов ([`Inbound`]).
+    pub secret: String,
     pub exit: Exit,
+}
+
+/// Тип входа: как телефон попадает на сервер. **Не зависит от выхода** ([`Exit`]): правила `auth_user` и
+/// узлы PROXY (любой тип узла из подключения, xhttp через Xray) одинаковы для любого входа. Чтобы добавить тип
+/// (Hysteria2, Trojan, AnyTLS, Shadowsocks 2022 — см. docs/SERVER-MODE.md «Протокол телефон → дом»), нужно:
+/// вариант здесь + [`Inbound::kind`]/[`Inbound::json`]/[`Inbound::label`], в `cli/src/server.rs::Protocol` —
+/// выдача секрета, ссылка и строка `[Proxy]`. `generate` и правила остаются как есть (тест `inbound_kinds`).
+/// sing-box: `option/<протокол>.go`, пользователь попадает в `metadata.User` во всех многопользовательских входах.
+#[derive(Debug, Clone)]
+pub enum Inbound {
+    /// VLESS + REALITY + Vision (`protocol/vless/inbound.go`, `option/tls.go::InboundRealityOptions`).
+    VlessReality {
+        /// Сайт-маска REALITY: SNI клиента и адрес, куда сервер проксирует чужие рукопожатия.
+        mask: String,
+        mask_port: u16,
+        private_key: String,
+        short_ids: Vec<String>,
+    },
+}
+
+impl Inbound {
+    /// Стабильный идентификатор (значение `protocol` в server.json).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::VlessReality { .. } => "vless-reality",
+        }
+    }
+
+    /// Объект `inbounds[0]` sing-box: слушатель, пользователи, TLS.
+    pub fn json(&self, listen: &str, port: u16, users: &[User]) -> Value {
+        match self {
+            Self::VlessReality { mask, mask_port, private_key, short_ids } => json!({
+                "type": "vless",
+                "tag": INBOUND_TAG,
+                "listen": listen,
+                "listen_port": port,
+                "users": users.iter().map(|u| json!({"name": u.name, "uuid": u.secret, "flow": FLOW})).collect::<Vec<_>>(),
+                "tls": {
+                    "enabled": true,
+                    "server_name": mask,
+                    "reality": {
+                        "enabled": true,
+                        "handshake": {"server": mask, "server_port": mask_port},
+                        "private_key": private_key,
+                        "short_id": short_ids,
+                    }
+                }
+            }),
+        }
+    }
+
+    /// Строка для консоли (`out.listeners`).
+    pub fn label(&self, listen: &str, port: u16) -> String {
+        let host = if listen.contains(':') { format!("[{listen}]") } else { listen.to_string() };
+        match self {
+            Self::VlessReality { mask, .. } => format!("vless+reality {host}:{port} (mask {mask})"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Server {
     pub listen: String,
     pub port: u16,
-    /// Сайт-маска REALITY: SNI клиента и адрес, куда сервер проксирует чужие рукопожатия.
-    pub mask: String,
-    pub mask_port: u16,
-    pub private_key: String,
-    pub short_ids: Vec<String>,
+    pub inbound: Inbound,
     pub users: Vec<User>,
     /// Доп. запрет для выходов в интернет (CIDR): внешний IP самого дома — иначе телефон попадёт в
     /// роутер через его WAN-адрес. Заполняет cli (резолв `host`).
@@ -114,7 +169,7 @@ const PROXY_GROUP: &str =
     "[Proxy Group]\nPROXY = url-test, url=https://www.gstatic.com/generate_204, interval=600, tolerance=50, policy-regex-filter=.*\n";
 
 pub fn generate(server: &Server, nodes: Vec<Node>, opts: &Options) -> Result<Output, ParseError> {
-    log::debug!(target: "gen::server", "server: {}:{} mask {}:{}, {} user(s), {} node(s)", server.listen, server.port, server.mask, server.mask_port, server.users.len(), nodes.len());
+    log::debug!(target: "gen::server", "server: {}, {} user(s), {} node(s)", server.inbound.label(&server.listen, server.port), server.users.len(), nodes.len());
     let need_proxy = server.users.iter().any(|u| u.exit == Exit::Proxy);
     // FINAL,DIRECT — только чтобы генератор не предупреждал про клиентский FINAL: правила заменяются ниже.
     let doc = fmt_shadowrocket::parse(&format!("{}[Rule]
@@ -176,24 +231,7 @@ FINAL,DIRECT
     let all = serde_json::from_str(crate::MATCH_ALL).expect("MATCH_ALL is JSON");
     push(crate::merge(all, &json!({"action": "reject"})), "(server) anything else → REJECT (fail-closed)".into());
 
-    let users: Vec<Value> = server.users.iter().map(|u| json!({"name": u.name, "uuid": u.uuid, "flow": FLOW})).collect();
-    let inbound = json!({
-        "type": "vless",
-        "tag": INBOUND_TAG,
-        "listen": server.listen,
-        "listen_port": server.port,
-        "users": users,
-        "tls": {
-            "enabled": true,
-            "server_name": server.mask,
-            "reality": {
-                "enabled": true,
-                "handshake": {"server": server.mask, "server_port": server.mask_port},
-                "private_key": server.private_key,
-                "short_id": server.short_ids,
-            }
-        }
-    });
+    let inbound = server.inbound.json(&server.listen, server.port, &server.users);
     log::trace!(target: "gen::server", "inbound {}", crate::redact(&inbound));
     out.config["inbounds"] = json!([inbound]);
     if let Some((addr, secret)) = &server.clash_api {
@@ -204,8 +242,7 @@ FINAL,DIRECT
     out.config["route"]["final"] = "DIRECT".into();
     out.rule_origins = origins;
     out.final_origin = "(server) unreachable: match-all REJECT is the last rule".into();
-    let host = if server.listen.contains(':') { format!("[{}]", server.listen) } else { server.listen.clone() };
-    out.listeners = vec![format!("vless+reality {host}:{} (mask {})", server.port, server.mask)];
+    out.listeners = vec![server.inbound.label(&server.listen, server.port)];
     out.inbounds = Vec::new();
     for w in &out.warnings[logged..] {
         log::warn!(target: "gen::server", "{w}");

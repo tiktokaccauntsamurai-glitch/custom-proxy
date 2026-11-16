@@ -150,7 +150,10 @@ fn rule_sets_and_dns() {
     let dns = &out.config["dns"];
     let main = find(&dns["servers"], "dns-main");
     assert_eq!(main["detour"], "HK 1");
-    assert_eq!(main["domain_resolver"], "dns-local");
+    // DNS-over-PROXY: домен dns.google уходит узлу как есть, без локального резолва (dialer.go::NewWithOptions).
+    assert!(main.get("domain_resolver").is_none());
+    // Домены узлов в запросах программ — системным DNS, не через прокси (иначе Xray в TUN ждал бы сам себя).
+    assert!(dns["rules"].as_array().unwrap().contains(&json!({"domain": ["hk.example.com"], "action": "route", "server": "dns-local"})));
     assert_eq!(dns["strategy"], "ipv4_only");
     assert_eq!(out.config["route"]["default_domain_resolver"], "dns-local");
     assert_eq!(find(&dns["servers"], "dns-hosts")["predefined"]["localhost"], json!(["127.0.0.1"]));
@@ -336,17 +339,36 @@ fn home_server(users: &[(&str, server::Exit)]) -> server::Server {
     server::Server {
         listen: "::".into(),
         port: 8443,
-        mask: "www.example.com".into(),
-        mask_port: 443,
-        private_key: "sLk8A5FO14fijkx48SgYIodNEF9Z8YJMwX1Gt5YH61s".into(),
-        short_ids: vec!["ce6f5e7f2c57d3be".into()],
+        inbound: server::Inbound::VlessReality {
+            mask: "www.example.com".into(),
+            mask_port: 443,
+            private_key: "sLk8A5FO14fijkx48SgYIodNEF9Z8YJMwX1Gt5YH61s".into(),
+            short_ids: vec!["ce6f5e7f2c57d3be".into()],
+        },
         users: users
             .iter()
-            .map(|(n, e)| server::User { name: n.to_string(), uuid: "cc660c1a-f537-4846-890b-b160bedce606".into(), exit: *e })
+            .map(|(n, e)| server::User { name: n.to_string(), secret: "cc660c1a-f537-4846-890b-b160bedce606".into(), exit: *e })
             .collect(),
         block: vec!["203.0.113.9/32".into()],
         clash_api: Some(("127.0.0.1:20999".into(), "s3cret".into())),
     }
+}
+
+/// Тип входа отделён от выходов: `Inbound` даёт только inbound-объект и подпись, а правила `auth_user`
+/// и узлы PROXY строит `generate` одинаково для любого входа.
+#[test]
+fn inbound_kinds() {
+    use server::Exit::*;
+    let srv = home_server(&[("a-ru", Direct), ("a-lan", Lan)]);
+    assert_eq!(srv.inbound.kind(), "vless-reality");
+    let j = srv.inbound.json("::", 8443, &srv.users);
+    assert_eq!((j["type"].as_str(), j["tag"].as_str(), j["listen_port"].as_u64()), (Some("vless"), Some(server::INBOUND_TAG), Some(8443)));
+    assert_eq!(j["users"].as_array().unwrap().len(), 2);
+    assert_eq!(j["users"][0]["uuid"], "cc660c1a-f537-4846-890b-b160bedce606", "secret goes to the protocol's own credential field");
+    assert_eq!(srv.inbound.label("::", 8443), "vless+reality [::]:8443 (mask www.example.com)");
+    let out = server::generate(&srv, Vec::new(), &Options::default()).unwrap();
+    assert_eq!(out.listeners, vec!["vless+reality [::]:8443 (mask www.example.com)".to_string()]);
+    assert_eq!(out.config["inbounds"][0], srv.inbound.json("::", 8443, &srv.users));
 }
 
 #[test]
@@ -517,4 +539,74 @@ fn block_quic_and_fallback_dns() {
     assert!(!off.config["route"]["rules"].as_array().unwrap().iter().any(|x| x["port"] == json!([443]) || x["type"] == "logical"));
     let bad = generate(&fmt_shadowrocket::parse(&conf.replace("all-proxy", "bogus")), &resources(), &Options::default()).unwrap();
     assert!(bad.warnings.iter().any(|w| w.contains("block-quic")));
+}
+
+#[test]
+fn global_mode() {
+    fn port() -> u16 {
+        20888
+    }
+    let conf = "[General]\ndns-server = system\nfallback-dns-server = tls://1.1.1.1:853, system\n[Rule]\nDOMAIN-SUFFIX,direct.example,DIRECT\nDOMAIN-SUFFIX,ads.example,REJECT\nRULE-SET,https://lists.test/media.list,DIRECT\nFINAL,DIRECT\n[Host]\n*.corp.example = server:system\nfixed.example = 10.1.2.3\n";
+    let nodes = vec![
+        node("n#0", "X = vless, x.example, 443, password=bf000d23-0752-40b4-affe-68f7707a9661, tls=true, obfs=xhttp, path=/x"),
+        node("n#1", "T = trojan, t.example, 443, password=pw"),
+        node("n#2", "I = trojan, 203.0.113.9, 443, password=pw"),
+    ];
+    let opts = Options { global: true, tun: true, nodes: Some(nodes.clone()), alloc_port: Some(port), ..Default::default() };
+    let out = generate(&fmt_shadowrocket::parse(conf), &resources(), &opts).unwrap();
+    let route = &out.config["route"];
+    // [Rule] не исполняется: ни DIRECT, ни REJECT, ни RULE-SET; final — PROXY.
+    assert!(!out.rule_origins.iter().any(|o| o.starts_with("[Rule]")), "{:?}", out.rule_origins);
+    assert!(route.get("rule_set").is_none());
+    assert_eq!(route["final"], "PROXY");
+    let rules = route["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), out.rule_origins.len());
+    assert_eq!(rules[2]["process_name"], json!(["xray.exe", "xray"]), "Xray loop protection stays first");
+    assert_eq!(rules[3]["action"], "resolve");
+    assert_eq!(rules[3]["server"], "dns-local");
+    assert_eq!(rules[4], json!({"ip_is_private": true, "action": "route", "outbound": "DIRECT"}));
+    assert_eq!(rules.len(), 5, "nothing else goes DIRECT: {rules:?}");
+    // DNS: основной (system → DoH) и резервный tls — через PROXY, system из fallback и [Host] — выброшены.
+    let dns = &out.config["dns"];
+    let servers = dns["servers"].as_array().unwrap();
+    let by_tag = |t: &str| servers.iter().find(|s| s["tag"] == t).cloned().unwrap_or(Value::Null);
+    assert_eq!(by_tag("dns-main")["type"], "https");
+    assert_eq!(by_tag("dns-main")["detour"], "PROXY");
+    assert_eq!(by_tag("dns-fallback-0")["detour"], "PROXY");
+    assert!(by_tag("dns-direct").get("detour").is_none());
+    assert_eq!(route["default_domain_resolver"], "dns-direct");
+    assert_eq!(dns["final"], "dns-fallback-0", "system fallback skipped → last network server is final");
+    for w in ["dns-server = system", "fallback-dns-server `system`", "server:system"] {
+        assert!(out.warnings.iter().any(|x| x.contains(w)), "warning `{w}`: {:?}", out.warnings);
+    }
+    let dr = dns["rules"].as_array().unwrap();
+    assert!(!dr.iter().any(|r| r["domain_suffix"] == json!(["corp.example"])));
+    let hosts = dr.iter().position(|r| r["domain"] == json!(["x.example", "t.example"])).expect("node hosts rule");
+    assert_eq!(dr[hosts]["server"], "dns-direct");
+    let lan = dr.iter().position(|r| r["server"] == "dns-local").expect("LAN names rule");
+    let fake = dr.iter().position(|r| r["server"] == "dns-fakeip").expect("fake-ip rule");
+    assert!(hosts < fake && lan < fake && lan + 1 < fake);
+    real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &out.config);
+
+    // Без TUN (системный прокси) — те же маршруты, DNS без fake-ip.
+    let plain = generate(&fmt_shadowrocket::parse(conf), &resources(), &Options { tun: false, ..opts }).unwrap();
+    assert_eq!(plain.config["route"]["final"], "PROXY");
+    assert!(!plain.config["dns"]["servers"].as_array().unwrap().iter().any(|s| s["type"] == "fakeip"));
+    real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &plain.config);
+
+    // Группа пользователя `Proxy` (другой регистр) — она и есть PROXY; DoH с доменом через прокси без локального резолва.
+    let conf2 = "[General]\ndns-server = https://dns.google/dns-query\n[Proxy Group]\nProxy = select, T\n[Rule]\nFINAL,DIRECT\n";
+    let o2 = generate(&fmt_shadowrocket::parse(conf2), &resources(), &Options { global: true, nodes: Some(nodes[1..].to_vec()), ..Default::default() }).unwrap();
+    assert_eq!(o2.config["route"]["final"], "Proxy");
+    let s2 = o2.config["dns"]["servers"].as_array().unwrap();
+    let main = s2.iter().find(|s| s["tag"] == "dns-main").unwrap();
+    assert_eq!(main["detour"], "Proxy");
+    assert!(main.get("domain_resolver").is_none(), "domain goes to the proxy as is");
+    let direct = s2.iter().find(|s| s["tag"] == "dns-direct").unwrap();
+    assert_eq!((direct["server"].as_str(), direct["domain_resolver"].as_str()), (Some("dns.google"), Some("dns-local")));
+    real_check("sing-box", "CPROXY_SING_BOX", &["check", "-c", "stdin"], &o2.config);
+
+    // Нет узлов — ошибка, а не тихий DIRECT (fail-closed).
+    let none = generate(&fmt_shadowrocket::parse("[Rule]\nFINAL,DIRECT\n"), &resources(), &Options { global: true, ..Default::default() });
+    assert!(none.is_err_and(|e| e.message.contains("mode global")));
 }

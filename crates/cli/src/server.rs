@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use singbox_gen::server::{Exit, Server, User};
+use singbox_gen::server::{Exit, Inbound, Server, User};
 
 pub const DEFAULT_PORT: u16 = 443;
 
@@ -43,8 +43,59 @@ pub struct Device {
     pub exits: Vec<Exit>,
 }
 
+/// Тип входа (протокол телефон → дом). Соответствует `singbox_gen::server::Inbound`; выходы (`Exit`) и узлы
+/// подключения от него не зависят. Новый тип = вариант здесь (все `match` ниже подскажет компилятор) +
+/// вариант `Inbound` в генераторе. Ключи REALITY (`Keys`) нужны только `VlessReality`; для других типов
+/// секрет пользователя — `Protocol::new_secret`, а общие поля ключей появятся вместе с первым таким типом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    VlessReality,
+}
+
+impl Protocol {
+    pub const DEFAULT: Protocol = Protocol::VlessReality;
+    pub const ALL: [Protocol; 1] = [Protocol::VlessReality];
+    pub const NAMES: &'static str = "vless-reality";
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "vless-reality" | "vless" | "reality" => Self::VlessReality,
+            _ => return None,
+        })
+    }
+
+    /// Значение `protocol` в server.json.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::VlessReality => "vless-reality",
+        }
+    }
+
+    /// Название для людей (экран, веб-страница).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::VlessReality => "VLESS + REALITY + Vision",
+        }
+    }
+
+    /// Нужен ли сайт-маска (REALITY маскируется под чужой сайт).
+    pub fn needs_mask(self) -> bool {
+        match self {
+            Self::VlessReality => true,
+        }
+    }
+
+    /// Новый секрет пользователя (UUID для VLESS); создаёт sing-box.
+    pub fn new_secret(self, sing_box: &Path) -> Result<String, String> {
+        match self {
+            Self::VlessReality => new_uuid(sing_box),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub protocol: Protocol,
     /// Адрес для телефона (домен DDNS или IP).
     pub host: String,
     pub listen: String,
@@ -92,7 +143,13 @@ impl Config {
             }
             devices.push(Device { name, exits });
         }
+        // Файлы до появления поля — всегда VLESS REALITY.
+        let protocol = match v["protocol"].as_str() {
+            None => Protocol::DEFAULT,
+            Some(name) => Protocol::parse(name).ok_or(format!("{}: unknown protocol `{name}` ({})", p.display(), Protocol::NAMES))?,
+        };
         let c = Config {
+            protocol,
             host: s("host")?,
             listen: v["listen"].as_str().unwrap_or("::").into(),
             port: v["port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(DEFAULT_PORT),
@@ -109,7 +166,7 @@ impl Config {
             .iter()
             .map(|d| json!({"name": d.name, "exits": d.exits.iter().map(|e| e.name()).collect::<Vec<_>>()}))
             .collect();
-        let v = json!({"host": self.host, "listen": self.listen, "port": self.port, "mask": self.mask, "devices": devices});
+        let v = json!({"protocol": self.protocol.id(), "host": self.host, "listen": self.listen, "port": self.port, "mask": self.mask, "devices": devices});
         write_file(&config_path(), &v, false)
     }
 
@@ -281,7 +338,7 @@ pub fn build(cfg: &Config, keys: &Keys) -> Result<Server, String> {
     let mut users = Vec::new();
     for (name, exit) in cfg.users() {
         let uuid = keys.uuids.get(&name).ok_or(format!("no UUID for user `{name}` in server-keys.json: re-add the device"))?;
-        users.push(User { name, uuid: uuid.clone(), exit });
+        users.push(User { name, secret: uuid.clone(), exit });
     }
     if users.is_empty() {
         return Err("no devices: `cproxy server user add <name>`".into());
@@ -300,13 +357,18 @@ pub fn build(cfg: &Config, keys: &Keys) -> Result<Server, String> {
         Err(e) => log::warn!(target: "server", "cannot resolve host `{}`: {e}; its public IP is not blocked for phones", cfg.host),
     }
     log::debug!(target: "server", "users {:?}, extra block {block:?}", users.iter().map(|u| &u.name).collect::<Vec<_>>());
+    let inbound = match cfg.protocol {
+        Protocol::VlessReality => Inbound::VlessReality {
+            mask: cfg.mask.clone(),
+            mask_port: 443,
+            private_key: keys.private_key.clone(),
+            short_ids: vec![keys.short_id.clone()],
+        },
+    };
     Ok(Server {
         listen: cfg.listen.clone(),
         port: cfg.port,
-        mask: cfg.mask.clone(),
-        mask_port: 443,
-        private_key: keys.private_key.clone(),
-        short_ids: vec![keys.short_id.clone()],
+        inbound,
         users,
         block,
         clash_api: None,
@@ -370,33 +432,37 @@ fn pct(s: &str) -> String {
 
 /// Ссылка `vless://` для Shadowrocket (формат Xray share link: VLESS + REALITY + Vision).
 pub fn link(cfg: &Config, keys: &Keys, device: &str, exit: Exit) -> Option<String> {
-    let uuid = keys.uuids.get(&user_name(device, exit))?;
+    let secret = keys.uuids.get(&user_name(device, exit))?;
     let host = if cfg.host.contains(':') { format!("[{}]", cfg.host) } else { cfg.host.clone() };
-    Some(format!(
-        "vless://{uuid}@{host}:{}?encryption=none&flow={}&security=reality&sni={}&fp=chrome&pbk={}&sid={}&type=tcp#{}",
-        cfg.port,
-        singbox_gen::server::FLOW,
-        cfg.mask,
-        keys.public_key,
-        keys.short_id,
-        pct(exit.node_name())
-    ))
+    Some(match cfg.protocol {
+        Protocol::VlessReality => format!(
+            "vless://{secret}@{host}:{}?encryption=none&flow={}&security=reality&sni={}&fp=chrome&pbk={}&sid={}&type=tcp#{}",
+            cfg.port,
+            singbox_gen::server::FLOW,
+            cfg.mask,
+            keys.public_key,
+            keys.short_id,
+            pct(exit.node_name())
+        ),
+    })
 }
 
 /// Строка `[Proxy]` Shadowrocket для узла «Дом-*» (ключи — docs/MAPPING.md: `password`=uuid, `xtls=2` → Vision,
 /// `peer` — SNI, `pbk`/`sid` — REALITY, `fp`). Наш парсер её принимает (тест `phone_conf`), но в самом Shadowrocket
 /// синтаксис VLESS REALITY в `.conf` не подтверждён (официальной документации нет) — поэтому только по флагу.
 pub fn proxy_line(cfg: &Config, keys: &Keys, device: &str, exit: Exit) -> Option<String> {
-    let uuid = keys.uuids.get(&user_name(device, exit))?;
-    Some(format!(
-        "{} = vless, {}, {}, password={uuid}, tls=true, xtls=2, peer={}, pbk={}, sid={}, fp=chrome",
-        exit.node_name(),
-        cfg.host,
-        cfg.port,
-        cfg.mask,
-        keys.public_key,
-        keys.short_id
-    ))
+    let secret = keys.uuids.get(&user_name(device, exit))?;
+    Some(match cfg.protocol {
+        Protocol::VlessReality => format!(
+            "{} = vless, {}, {}, password={secret}, tls=true, xtls=2, peer={}, pbk={}, sid={}, fp=chrome",
+            exit.node_name(),
+            cfg.host,
+            cfg.port,
+            cfg.mask,
+            keys.public_key,
+            keys.short_id
+        ),
+    })
 }
 
 /// Узлы-выходы, которые не должны попадать в автогруппы телефона: в url-test «Дом-RU» выиграл бы у VPS
@@ -467,6 +533,142 @@ pub fn phone_conf(rules: &str, cfg: &Config, keys: &Keys, device: &Device, with_
     (fmt_shadowrocket::write(&doc), changes)
 }
 
+/// Имя устройства: латиница, цифры, `-`, `_` (из него складывается имя пользователя sing-box).
+pub fn check_device_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!("bad device name `{name}`: use latin letters, digits, - and _"));
+    }
+    Ok(())
+}
+
+/// `ru,vps` → выходы без повторов.
+pub fn parse_exits<'a>(items: impl IntoIterator<Item = &'a str>) -> Result<Vec<Exit>, String> {
+    let mut exits = Vec::new();
+    for e in items.into_iter().map(str::trim).filter(|e| !e.is_empty()) {
+        let x = Exit::parse(e).ok_or(format!("bad exit `{e}` ({})", Exit::NAMES))?;
+        if !exits.contains(&x) {
+            exits.push(x);
+        }
+    }
+    Ok(exits)
+}
+
+/// Устройство и его выходы (CLI `server user add`, веб-страница web.rs). UUID новых пар создаёт sing-box.
+/// `replace` — выходы заменяются (UUID снятых удаляются: их ссылки перестают работать), иначе добавляются к имеющимся.
+pub fn set_device(name: &str, exits: Vec<Exit>, replace: bool, sing_box: &Path) -> Result<(), String> {
+    check_device_name(name)?;
+    // Устройство без выходов не получило бы ни одного пользователя: оно молча ничего не делало бы.
+    if exits.is_empty() {
+        return Err(format!("device `{name}`: pick at least one exit ({})", Exit::NAMES));
+    }
+    let mut cfg = Config::load()?;
+    let mut keys = Keys::load()?;
+    for x in &exits {
+        let user = user_name(name, *x);
+        if !keys.uuids.contains_key(&user) {
+            keys.uuids.insert(user, cfg.protocol.new_secret(sing_box)?);
+        }
+    }
+    match cfg.devices.iter_mut().find(|d| d.name == name) {
+        Some(d) => {
+            if replace {
+                for x in Exit::ALL.into_iter().filter(|x| !exits.contains(x)) {
+                    keys.uuids.remove(&user_name(name, x));
+                }
+                d.exits = exits;
+            } else {
+                for x in exits {
+                    if !d.exits.contains(&x) {
+                        d.exits.push(x);
+                    }
+                }
+            }
+        }
+        None => cfg.devices.push(Device { name: name.to_string(), exits }),
+    }
+    keys.save()?;
+    cfg.save()?;
+    log::info!(target: "server", "device `{name}` saved");
+    Ok(())
+}
+
+/// Удаляет устройство вместе с UUID: его ссылки больше не работают.
+pub fn remove_device(name: &str) -> Result<(), String> {
+    let mut cfg = Config::load()?;
+    let mut keys = Keys::load()?;
+    let Some(d) = cfg.devices.iter().position(|d| d.name == name).map(|i| cfg.devices.remove(i)) else {
+        return Err(format!("no device `{name}`"));
+    };
+    for x in Exit::ALL {
+        keys.uuids.remove(&user_name(&d.name, x));
+    }
+    keys.save()?;
+    cfg.save()?;
+    log::info!(target: "server", "device `{name}` removed");
+    Ok(())
+}
+
+/// Первичная настройка (веб-страница; CLI `server init` печатает больше и живёт в main.rs): ключи REALITY и
+/// server.json. Уже существующие ключи не трогает. Маска не задана — берётся самая быстрая из кандидатов.
+pub fn init(protocol: Protocol, host: String, port: u16, mask: Option<String>, sing_box: &Path) -> Result<(), String> {
+    if Config::load().is_ok() {
+        return Err("server is already initialised: change settings instead".into());
+    }
+    let mask = match mask {
+        Some(m) => {
+            check_mask(&m, 443).map_err(|e| format!("mask {m}: {e}"))?;
+            m
+        }
+        None => pick_mask()?,
+    };
+    let keys = match Keys::load() {
+        Ok(k) => k,
+        Err(_) => new_keys(sing_box)?,
+    };
+    keys.save()?;
+    Config { protocol, host, listen: "::".into(), port, mask, devices: Vec::new() }.save()
+}
+
+/// Меняет адрес/порт/маску (веб-страница). Новая маска проверяется (TLS 1.3 + X25519 + h2), иначе ошибка.
+/// Возвращает список сделанных изменений.
+pub fn set_params(host: Option<String>, port: Option<u16>, mask: Option<String>) -> Result<Vec<String>, String> {
+    let mut cfg = Config::load()?;
+    let mut changes = Vec::new();
+    // Сравнение после trim: пробел из формы не должен считаться изменением.
+    if let Some(h) = host.map(|h| h.trim().to_string()).filter(|h| !h.is_empty() && *h != cfg.host) {
+        changes.push(format!("host {} → {h}", cfg.host));
+        cfg.host = h;
+    }
+    if let Some(p) = port.filter(|p| *p != 0 && *p != cfg.port) {
+        changes.push(format!("port {} → {p}", cfg.port));
+        cfg.port = p;
+    }
+    if let Some(m) = mask.map(|m| m.trim().to_string()).filter(|m| !m.is_empty() && *m != cfg.mask && cfg.protocol.needs_mask()) {
+        check_mask(&m, 443).map_err(|e| format!("mask {m}: {e}"))?;
+        changes.push(format!("mask {} → {m}", cfg.mask));
+        cfg.mask = m;
+    }
+    if !changes.is_empty() {
+        cfg.save()?;
+        log::info!(target: "server", "params changed: {}", changes.join("; "));
+    }
+    Ok(changes)
+}
+
+/// QR-код как SVG (веб-страница): тёмные модули одним `path`, тихая зона 4 модуля.
+pub fn qr_svg(text: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| e.to_string())?;
+    let w = code.width();
+    let mut d = String::new();
+    for (i, c) in code.to_colors().into_iter().enumerate() {
+        if c == qrcode::Color::Dark {
+            d.push_str(&format!("M{},{}h1v1h-1z", i % w + 4, i / w + 4));
+        }
+    }
+    let n = w + 8;
+    Ok(format!("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {n} {n}\" shape-rendering=\"crispEdges\"><rect width=\"{n}\" height=\"{n}\" fill=\"#fff\"/><path d=\"{d}\" fill=\"#000\"/></svg>"))
+}
+
 /// QR-код в терминал (полублоки: две строки модулей на строку текста).
 pub fn qr(text: &str) -> Result<String, String> {
     use qrcode::render::unicode::Dense1x2;
@@ -480,7 +682,7 @@ mod tests {
 
     #[test]
     fn share_link() {
-        let cfg = Config { host: "home.example.net".into(), listen: "::".into(), port: 443, mask: "www.samsung.com".into(), devices: vec![] };
+        let cfg = Config { protocol: Protocol::DEFAULT, host: "home.example.net".into(), listen: "::".into(), port: 443, mask: "www.samsung.com".into(), devices: vec![] };
         let keys = Keys {
             private_key: "x".into(),
             public_key: "PUB".into(),
@@ -512,10 +714,22 @@ mod tests {
     }
 
     #[test]
+    fn protocol_and_device_guards() {
+        assert_eq!(Protocol::parse("VLESS"), Some(Protocol::VlessReality));
+        assert_eq!(Protocol::parse(Protocol::DEFAULT.id()), Some(Protocol::DEFAULT));
+        assert!(Protocol::parse("nope").is_none());
+        // Без выходов устройство не создаётся — и до обращения к файлам/sing-box.
+        assert!(set_device("phone", Vec::new(), false, Path::new("/nonexistent")).unwrap_err().contains("at least one exit"));
+        assert!(set_device("bad name", vec![Exit::Direct], false, Path::new("/nonexistent")).is_err());
+        assert_eq!(parse_exits(["ru", " vps", "ru", ""]).unwrap(), vec![Exit::Direct, Exit::Proxy]);
+        assert!(parse_exits(["wan"]).is_err());
+    }
+
+    #[test]
     fn phone_conf() {
         // Как у пользователя: без [Proxy], AUTO — url-test по regex «всё, кроме России», CRLF.
         let rules = "[General]\r\ndns-server = system\r\n\r\n[Proxy Group]\r\n# AUTO — автовыбор\r\nAUTO = url-test, policy-regex-filter=^(?!.*(Россия|Russia|🇷🇺)).*, interval=600, timeout=5, url=http://www.gstatic.com/generate_204\r\nMANUAL = select, DIRECT\r\n\r\n[Rule]\r\nDOMAIN-SUFFIX,ru,DIRECT\r\nFINAL,AUTO\r\n";
-        let cfg = Config { host: "home.example.net".into(), listen: "::".into(), port: 443, mask: "www.samsung.com".into(), devices: vec![] };
+        let cfg = Config { protocol: Protocol::DEFAULT, host: "home.example.net".into(), listen: "::".into(), port: 443, mask: "www.samsung.com".into(), devices: vec![] };
         let keys = Keys {
             private_key: "x".into(),
             public_key: "Z1XXLsKYkYxuiYjJIkRvtIKFepCYHTgON-GwPq7SOV4".into(),

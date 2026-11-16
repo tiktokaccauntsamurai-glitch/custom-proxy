@@ -8,6 +8,8 @@
 //! исключения; `*` = fake-ip выключен. Резолв для правил (`resolve`, direct) fake-ip не получает:
 //! `dns/router.go::Lookup` → `matchDNS(allowFakeIP=false)`.
 //! `fallback-dns-server` — цепочка evaluate/respond (см. `build`). Фаза 3: `hijack-dns` из [General].
+//! Глобальный режим (`Mode::via`, ARCHITECTURE.md §21): все серверы — `detour` PROXY (системный пропускается),
+//! домены узлов — прямым `dns-direct`, локальные имена — `dns-local`.
 
 use std::collections::HashSet;
 
@@ -92,6 +94,7 @@ pub fn server(spec: &str, tag: &str, outbounds: &HashSet<String>) -> Result<Valu
     };
     let (host, port) = split_host_port(hostport);
     let mut m = Map::new();
+    let is_domain = !is_ip(&host);
     m.insert("type".into(), kind.clone().into());
     m.insert("tag".into(), tag.into());
     m.insert("server".into(), host.clone().into());
@@ -100,9 +103,6 @@ pub fn server(spec: &str, tag: &str, outbounds: &HashSet<String>) -> Result<Valu
     }
     if matches!(kind.as_str(), "https" | "h3") {
         m.insert("path".into(), path.unwrap_or_else(|| "/dns-query".into()).into());
-    }
-    if !is_ip(&host) {
-        m.insert("domain_resolver".into(), LOCAL.into());
     }
     // `#proxy` / `#proxy=name` — DNS-over-PROXY.
     for kv in fragment.into_iter().flat_map(|f| f.split('&')) {
@@ -116,8 +116,37 @@ pub fn server(spec: &str, tag: &str, outbounds: &HashSet<String>) -> Result<Valu
             m.insert("detour".into(), detour.into());
         }
     }
+    // Домен DNS-сервера: напрямую — через системный DNS; через прокси — домен уходит прокси как есть
+    // (`common/dialer/dialer.go::NewWithOptions`: при detour без domain_resolver локального резолва нет).
+    if is_domain && !m.contains_key("detour") {
+        m.insert("domain_resolver".into(), LOCAL.into());
+    }
     Ok(Value::Object(m))
 }
+
+/// Глобальный режим: сервер ходит через прокси `via` (явный `#proxy=…` пользователя сильнее).
+fn via_proxy(s: &mut Value, via: &str) {
+    if let Some(m) = s.as_object_mut().filter(|m| m.get("type").is_some_and(|t| t != "local" && t != "hosts")) {
+        if !m.contains_key("detour") {
+            m.insert("detour".into(), via.into());
+        }
+        m.remove("domain_resolver");
+    }
+}
+
+/// Параметры построения DNS, которые зависят от режима запуска (cli → `Options`).
+pub struct Mode<'a> {
+    /// TUN: fake-ip (ARCHITECTURE.md §14).
+    pub tun: bool,
+    /// Глобальный режим: тег PROXY, через который идут все DNS-серверы (ARCHITECTURE.md §21).
+    pub via: Option<&'a str>,
+    /// Домены серверов узлов: если основной DNS за прокси, их резолвит прямой сервер (иначе Xray в TUN,
+    /// спрашивающий домен своего сервера через системный DNS → hijack-dns, ждал бы сам себя).
+    pub node_hosts: &'a [String],
+}
+
+/// Прямой DNS для доменов серверов узлов в глобальном режиме (`route.default_domain_resolver`).
+pub const DIRECT: &str = "dns-direct";
 
 /// Список доменов с шаблонами Shadowrocket → условие DNS-правила sing-box.
 fn domain_matcher(items: &[String]) -> Map<String, Value> {
@@ -138,7 +167,8 @@ fn domain_matcher(items: &[String]) -> Map<String, Value> {
     m
 }
 
-pub fn build(doc: &Document, outbounds: &HashSet<String>, warnings: &mut Vec<String>, tun: bool) -> Dns {
+pub fn build(doc: &Document, outbounds: &HashSet<String>, warnings: &mut Vec<String>, mode: &Mode) -> Dns {
+    let tun = mode.tun;
     let mut servers = vec![];
     let main_spec = doc
         .general("dns-server")
@@ -148,10 +178,30 @@ pub fn build(doc: &Document, outbounds: &HashSet<String>, warnings: &mut Vec<Str
         None
     });
     // По умолчанию — зашифрованный DNS по IP, без системного резолвера.
-    let main = main.unwrap_or_else(|| json!({"type": "https", "tag": MAIN, "server": "1.1.1.1", "path": "/dns-query"}));
+    let default_doh = |tag: &str| json!({"type": "https", "tag": tag, "server": "1.1.1.1", "path": "/dns-query"});
+    let mut main = main.unwrap_or_else(|| default_doh(MAIN));
+    // Глобальный режим: системный DNS через прокси не пустить → DoH по умолчанию через прокси.
+    if mode.via.is_some() && main["type"] == "local" {
+        warnings.push("mode global: dns-server = system cannot go through the proxy; using DoH 1.1.1.1 via PROXY".into());
+        main = default_doh(MAIN);
+    }
+    // Прямой резолвер для доменов узлов в глобальном режиме: тот же сервер без прокси (выбор пользователя),
+    // системный/через прокси — DoH 1.1.1.1. Не системный: в strict kill switch пускает только ядра.
+    let direct = mode.via.map(|_| {
+        let mut d = main.clone();
+        if d.get("detour").is_some() {
+            d = default_doh(DIRECT);
+        }
+        d["tag"] = DIRECT.into();
+        d
+    });
+    if let Some(via) = mode.via {
+        via_proxy(&mut main, via);
+    }
     let main_via_proxy = main.get("detour").is_some();
     servers.push(main);
     servers.push(json!({"type": "local", "tag": LOCAL}));
+    servers.extend(direct);
 
     let mut rules = vec![];
     let mut predefined = Map::new();
@@ -167,12 +217,21 @@ pub fn build(doc: &Document, outbounds: &HashSet<String>, warnings: &mut Vec<Str
         };
         let target = if let Some(spec) = value.strip_prefix("server:") {
             if spec.eq_ignore_ascii_case("system") {
+                if mode.via.is_some() {
+                    warnings.push(format!("[Host] line {line}: mode global: server:system would bypass the proxy; ignored"));
+                    continue;
+                }
                 LOCAL.to_string()
             } else {
                 let tag = format!("dns-host-{extra}");
                 extra += 1;
                 match server(spec, &tag, outbounds) {
-                    Ok(s) => servers.push(s),
+                    Ok(mut s) => {
+                        if let Some(via) = mode.via {
+                            via_proxy(&mut s, via);
+                        }
+                        servers.push(s)
+                    }
                     Err(e) => {
                         warnings.push(format!("[Host] line {line}: {e}"));
                         continue;
@@ -193,6 +252,19 @@ pub fn build(doc: &Document, outbounds: &HashSet<String>, warnings: &mut Vec<Str
     }
     if !predefined.is_empty() {
         servers.push(json!({"type": "hosts", "tag": HOSTS, "predefined": predefined}));
+    }
+
+    // Домены серверов-прокси нельзя резолвить через сам прокси: глобальный режим — прямой DoH, иначе системный.
+    let domain_resolver = if mode.via.is_some() { DIRECT } else if main_via_proxy { LOCAL } else { MAIN }.to_string();
+    // Те же домены в DNS-запросах программ (Xray в TUN спрашивает свой сервер через системный DNS → hijack-dns):
+    // при DNS за прокси — тем же прямым резолвером, до fake-ip. Ядра sing-box ходят через default_domain_resolver.
+    if domain_resolver != MAIN && !mode.node_hosts.is_empty() {
+        rules.push(json!({"domain": mode.node_hosts, "action": "route", "server": domain_resolver}));
+    }
+    // Глобальный режим: локальные имена — только системному DNS (роутеру); `lib.rs::global_rules` пускает их
+    // адреса DIRECT. До fake-ip и real-ip исключений (те ведут в MAIN, т. е. за прокси).
+    if mode.via.is_some() {
+        rules.push(json!({"domain": ["localhost"], "domain_suffix": crate::LAN_SUFFIXES, "action": "route", "server": LOCAL}));
     }
 
     // fake-ip — после [Host]: явные сопоставления важнее.
@@ -228,8 +300,14 @@ pub fn build(doc: &Document, outbounds: &HashSet<String>, warnings: &mut Vec<Str
     for (i, spec) in fallback_specs.iter().enumerate() {
         let tag = format!("dns-fallback-{i}");
         match server(spec, &tag, outbounds) {
+            Ok(s) if s["type"] == "local" && mode.via.is_some() => {
+                warnings.push(format!("fallback-dns-server `{spec}`: mode global: system DNS would bypass the proxy; skipped"))
+            }
             Ok(s) if s["type"] == "local" => fallback_tags.push(LOCAL.to_string()),
-            Ok(s) => {
+            Ok(mut s) => {
+                if let Some(via) = mode.via {
+                    via_proxy(&mut s, via);
+                }
                 servers.push(s);
                 fallback_tags.push(tag);
             }
@@ -270,7 +348,5 @@ pub fn build(doc: &Document, outbounds: &HashSet<String>, warnings: &mut Vec<Str
     if config["rules"].as_array().is_some_and(Vec::is_empty) {
         config.as_object_mut().unwrap().remove("rules");
     }
-    // Домены серверов-прокси нельзя резолвить через сам прокси.
-    let domain_resolver = if main_via_proxy { LOCAL } else { MAIN }.to_string();
     Dns { config, fakeip, domain_resolver }
 }

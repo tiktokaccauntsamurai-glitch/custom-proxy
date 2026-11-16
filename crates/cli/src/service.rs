@@ -91,11 +91,6 @@ pub struct Sources {
 }
 
 pub fn plan(src: &Sources, debug: bool, user_exists: bool) -> Result<Vec<Step>, String> {
-    for f in ["server.json", "server-keys.json"] {
-        if !src.data.join(f).is_file() {
-            return Err(format!("{} not found: run `cproxy server init` and `cproxy server user add` first", src.data.join(f).display()));
-        }
-    }
     let mut steps = Vec::new();
     if !user_exists {
         steps.push(run("useradd", &["--system", "--home-dir", HOME, "--no-create-home", "--shell", "/usr/sbin/nologin", USER]));
@@ -107,11 +102,69 @@ pub fn plan(src: &Sources, debug: bool, user_exists: bool) -> Result<Vec<Step>, 
     if let Some(x) = &src.xray {
         steps.push(Step::Copy { from: x.clone(), to: at(LIB, "xray"), mode: 0o755 });
     }
-    steps.push(Step::Copy { from: src.data.join("server.json"), to: at(HOME, "server.json"), mode: 0o600 });
-    steps.push(Step::Copy { from: src.data.join("server-keys.json"), to: at(HOME, "server-keys.json"), mode: 0o600 });
+    steps.extend(data_steps(&src.data, debug)?);
+    steps.push(run("chown", &["-R", &format!("{USER}:{USER}"), HOME]));
+    steps.push(Step::Write { to: PathBuf::from(UNIT), text: unit_text(debug), mode: 0o644 });
+    steps.push(run("systemctl", &["daemon-reload"]));
+    steps.push(run("systemctl", &["enable", "--now", "cproxy.service"]));
+    Ok(steps)
+}
+
+/// Служба установлена (есть unit). Только Linux.
+pub fn installed() -> bool {
+    cfg!(target_os = "linux") && Path::new(UNIT).is_file()
+}
+
+/// `cproxy service sync`: данные сервера пользователя (устройства, ключи, подключение) → HOME и перезапуск службы.
+/// Вызывается после `server user add|remove` и из веб-страницы (web.rs): без этого служба держит старый набор
+/// пользователей. Бинари и unit не трогает; `--debug` берёт из установленного unit.
+pub fn sync_plan(data: &Path) -> Result<Vec<Step>, String> {
+    let debug = !std::fs::read_to_string(UNIT).is_ok_and(|t| t.contains("run --server --no-debug"));
+    let mut steps = Vec::new();
+    if data != Path::new(HOME) {
+        steps.extend(data_steps(data, debug)?);
+        steps.push(run("chown", &["-R", &format!("{USER}:{USER}"), HOME]));
+    }
+    steps.push(run("systemctl", &["restart", "cproxy.service"]));
+    Ok(steps)
+}
+
+/// Результат [`apply`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// Службы нет: работает только запущенный вручную экземпляр (его перезапускает пользователь).
+    NoService,
+    /// Данные скопированы, служба перезапущена.
+    Synced,
+    /// Нужен root: CLI перезапускается через sudo, веб-страница просит выполнить `sudo cproxy service sync`.
+    NeedRoot,
+}
+
+/// Применяет изменение устройств/параметров к установленной службе, если есть права.
+pub fn apply() -> Result<Applied, String> {
+    if !installed() {
+        return Ok(Applied::NoService);
+    }
+    if !crate::elevate::is_admin() {
+        return Ok(Applied::NeedRoot);
+    }
+    execute(&sync_plan(&crate::store::data_dir())?)?;
+    Ok(Applied::Synced)
+}
+
+/// Шаги копирования данных сервера в HOME: server.json, server-keys.json, settings.json (+ локальные файлы).
+fn data_steps(data: &Path, debug: bool) -> Result<Vec<Step>, String> {
+    for f in ["server.json", "server-keys.json"] {
+        if !data.join(f).is_file() {
+            return Err(format!("{} not found: run `cproxy server init` and `cproxy server user add` first", data.join(f).display()));
+        }
+    }
+    let mut steps = Vec::new();
+    steps.push(Step::Copy { from: data.join("server.json"), to: at(HOME, "server.json"), mode: 0o600 });
+    steps.push(Step::Copy { from: data.join("server-keys.json"), to: at(HOME, "server-keys.json"), mode: 0o600 });
 
     // settings.json: только то, что нужно серверу (подключение для выхода vps, правила — если узлы в [Proxy]).
-    let settings: serde_json::Value = std::fs::read_to_string(src.data.join("settings.json"))
+    let settings: serde_json::Value = std::fs::read_to_string(data.join("settings.json"))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| serde_json::json!({}));
@@ -129,10 +182,6 @@ pub fn plan(src: &Sources, debug: bool, user_exists: bool) -> Result<Vec<Step>, 
         }
     }
     steps.push(Step::Write { to: at(HOME, "settings.json"), text: serde_json::to_string_pretty(&out).unwrap(), mode: 0o600 });
-    steps.push(run("chown", &["-R", &format!("{USER}:{USER}"), HOME]));
-    steps.push(Step::Write { to: PathBuf::from(UNIT), text: unit_text(debug), mode: 0o644 });
-    steps.push(run("systemctl", &["daemon-reload"]));
-    steps.push(run("systemctl", &["enable", "--now", "cproxy.service"]));
     Ok(steps)
 }
 
@@ -221,6 +270,12 @@ mod tests {
         assert_eq!((v["tun"].as_bool(), v["system_proxy"].as_bool()), (Some(false), Some(false)));
         assert!(steps.iter().any(|s| matches!(s, Step::Copy { to, mode: 0o600, .. } if to.ends_with("server-keys.json"))));
         assert!(matches!(steps.last().unwrap(), Step::Run(p, a) if p == "systemctl" && a[0] == "enable"));
+        // sync: только данные + restart, без бинарей и unit.
+        let sync = sync_plan(&dir).unwrap();
+        assert!(sync.iter().any(|s| matches!(s, Step::Copy { to, .. } if to.ends_with("server.json"))));
+        assert!(!sync.iter().any(|s| matches!(s, Step::Copy { to, .. } if to.ends_with("cproxy") || to.ends_with("sing-box"))));
+        assert!(matches!(sync.last().unwrap(), Step::Run(p, a) if p == "systemctl" && a == &["restart", "cproxy.service"]));
+        assert!(sync_plan(Path::new("/nonexistent-cproxy-dir")).is_err());
         assert!(!uninstall_plan(false).iter().any(|s| s.to_string().contains(HOME)), "keys kept without --purge");
         let _ = std::fs::remove_dir_all(&dir);
     }

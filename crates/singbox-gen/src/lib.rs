@@ -69,6 +69,10 @@ pub struct Options {
     /// Метка сокетов ядер (Linux, kill switch: `route.default_mark`, Xray `sockopt.mark`). sing-box принимает
     /// её только на Linux (`route/network.go:79`).
     pub fwmark: Option<u32>,
+    /// Глобальный режим (`cproxy set mode global|strict`, как «Прокси» в Shadowrocket): [Rule] не исполняется
+    /// (ни DIRECT, ни REJECT), весь трафик и DNS — через PROXY, напрямую только локальная сеть. Нет PROXY —
+    /// ошибка генерации (fail-closed). См. `global_rules`, `dns::build`, ARCHITECTURE.md §21.
+    pub global: bool,
 }
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1";
@@ -304,6 +308,8 @@ pub fn generate(doc: &Document, res: &dyn Resources, opts: &Options) -> Result<O
     let mut outbounds = vec![json!({"type": "direct", "tag": "DIRECT"})];
     let mut endpoints = Vec::new();
     let mut nodes = Vec::new();
+    // Домены серверов узлов: DNS сам их резолвит напрямую, даже если основной DNS идёт через прокси (dns.rs).
+    let mut node_hosts: Vec<String> = Vec::new();
     let mut xray_cfg = xray::Config::new();
     let src = match &opts.nodes {
         Some(list) => list.clone(),
@@ -341,6 +347,9 @@ pub fn generate(doc: &Document, res: &dyn Resources, opts: &Options) -> Result<O
             }
         }
         nodes.push(p.name.clone());
+        if p.server.parse::<std::net::IpAddr>().is_err() && !node_hosts.contains(&p.server) {
+            node_hosts.push(p.server.clone());
+        }
     }
 
     // Шаг 2. Группы [Proxy Group] → selector/urltest (group_json). Члены разрешаются без учёта
@@ -422,8 +431,116 @@ pub fn generate(doc: &Document, res: &dyn Resources, opts: &Options) -> Result<O
         warned_http_reject: false,
     };
 
-    // Шаг 3. [Rule] → route.rules (порядок и семантика: ARCHITECTURE.md §3).
+    // Шаг 3. Служебные правила (sniff, hijack-dns, петля Xray), затем [Rule] → route.rules (`conf_rules`,
+    // ARCHITECTURE.md §3) или глобальный режим (`global_rules`, §21).
+    // sniff — аналог extended-matching Shadowrocket (домен из SNI/Host); hijack-dns — DNS-запросы,
+    // пришедшие как трафик (важно для TUN). Оба не мешают mixed-inbound.
+    let mut route_rules = vec![json!({"action": "sniff"}), json!({"protocol": "dns", "action": "hijack-dns"})];
+    let mut rule_origins = vec!["(cproxy) sniff: domain from TLS SNI / HTTP Host".to_string(), "(cproxy) hijack-dns".to_string()];
+    // TUN ловит и трафик самого Xray до его серверов: без этого правила — петля (Xray → TUN → sing-box →
+    // узел-socks → Xray). sing-box свои соединения защищает сам (auto_detect_interface).
+    if opts.tun && !xray_cfg.is_empty() {
+        route_rules.push(json!({"process_name": ["xray.exe", "xray"], "action": "route", "outbound": "DIRECT"}));
+        rule_origins.push("(cproxy) TUN: Xray's own connections go direct (loop protection)".into());
+    }
     let mut conv = rules::Converter::new(res);
+    let (final_tag, final_origin) = if opts.global {
+        global_rules(&ctx, &mut route_rules, &mut rule_origins)?
+    } else {
+        conf_rules(doc, &mut conv, &mut ctx, &mut route_rules, &mut rule_origins)?
+    };
+    ctx.warnings.extend(conv.warnings);
+
+    // Шаг 4. DNS (dns.rs, ARCHITECTURE.md §4) и сборка итогового JSON.
+    // Глобальный режим: все DNS-серверы — через PROXY (тег уже проверен в `global_rules`).
+    let via = opts.global.then(|| proxy_tag(&ctx)).flatten();
+    let dns = dns::build(doc, &ctx.tags, &mut ctx.warnings, &dns::Mode { tun: opts.tun, via: via.as_deref(), node_hosts: &node_hosts });
+    let mut route = Map::new();
+    route.insert("rules".into(), route_rules.into());
+    if !conv.rule_sets.is_empty() {
+        route.insert("rule_set".into(), conv.rule_sets.into());
+    }
+    route.insert("final".into(), final_tag.into());
+    route.insert("default_domain_resolver".into(), dns.domain_resolver.into());
+    if opts.tun {
+        // Исходящие соединения sing-box привязываются к физическому интерфейсу, а не к своему TUN.
+        route.insert("auto_detect_interface".into(), true.into());
+    }
+    if let Some(mark) = opts.fwmark {
+        // Конфликтует только с tun.auto_redirect (common/dialer/default.go:261), его не используем.
+        route.insert("default_mark".into(), mark.into());
+    }
+
+    // Логи sing-box идут в stderr без метки времени: cli ставит свою и пишет в общий файл.
+    let log = match &opts.log_level {
+        Some(level) => json!({"level": level}),
+        None => json!({"disabled": true}),
+    };
+    let (mut inbounds, mut listeners, inbound_list) = listeners(doc, opts, &mut ctx.warnings);
+    if opts.tun {
+        inbounds.push(tun_inbound(doc, &opts.tun_exclude, &mut ctx.warnings));
+        listeners.push(format!("tun {TUN_NAME}{}", if dns.fakeip { " (fake-ip)" } else { "" }));
+    }
+    log::debug!(target: "gen::listen", "inbounds: {listeners:?}");
+    let mut config = json!({
+        "log": log,
+        "dns": dns.config,
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "route": route,
+    });
+    if !endpoints.is_empty() {
+        config["endpoints"] = endpoints.into();
+    }
+    if let Some((addr, secret)) = &opts.clash_api {
+        config["experimental"] = json!({"clash_api": {"external_controller": addr, "secret": secret}});
+    }
+    for w in &ctx.warnings {
+        log::warn!(target: "gen", "{w}");
+    }
+    log::debug!(target: "gen", "done: {} outbounds, {} route rules, {} warnings", config["outbounds"].as_array().map_or(0, Vec::len), rule_origins.len(), ctx.warnings.len());
+    let xray = (!xray_cfg.is_empty()).then(|| xray_cfg.build(opts.log_level.as_deref(), opts.fwmark));
+    if let Some(x) = &xray {
+        log::trace!(target: "gen::xray", "xray config (secrets redacted): {}", redact(x));
+    }
+    Ok(Output { config, warnings: ctx.warnings, rule_origins, final_origin, listeners, inbounds: inbound_list, xray })
+}
+
+/// Тег политики PROXY (группа пользователя с любым регистром или синтетическая из всех узлов).
+fn proxy_tag(ctx: &Ctx) -> Option<String> {
+    canonical(ctx.tags.iter().map(String::as_str), "PROXY")
+}
+
+/// Локальные имена: в глобальном режиме их резолвит системный DNS (роутер), а не DNS за прокси.
+const LAN_SUFFIXES: &[&str] = &["lan", "local", "localdomain", "home.arpa"];
+
+/// Глобальный режим (`Options::global`, ARCHITECTURE.md §21): [Rule] не исполняется — ни DIRECT, ни REJECT
+/// (решение пользователя 2026-11-16). Напрямую только локальная сеть:
+/// - локальные имена → `resolve` системным DNS (`route.go::actionResolve`, домен в Destination остаётся);
+/// - `ip_is_private` (`!N.IsPublicAddr`: частные, loopback, link-local, multicast) → DIRECT. fake-ip сюда не
+///   попадает: `route.go::prepareMatchMetadata` заменяет fake-IP доменом до правил, а `IPIsPrivateItem`
+///   без адреса и без `resolve` не совпадает (fake-ip IPv6 `fc00::/18` иначе считался бы частным);
+/// - остальное — `route.final = PROXY`. Сервер недоступен — соединения падают, напрямую ничего не уходит.
+fn global_rules(ctx: &Ctx, route_rules: &mut Vec<Value>, rule_origins: &mut Vec<String>) -> Result<(String, String), ParseError> {
+    let Some(proxy) = proxy_tag(ctx) else {
+        return Err(ParseError { line: 0, message: "mode global: no proxy nodes (PROXY), nothing to send traffic through".into() });
+    };
+    log::debug!(target: "gen::rule", "mode global: [Rule] is not executed, everything → `{proxy}`, LAN → DIRECT");
+    route_rules.push(json!({"domain": ["localhost"], "domain_suffix": LAN_SUFFIXES, "action": "resolve", "server": dns::LOCAL}));
+    rule_origins.push("(cproxy) mode global: local names (*.lan, *.local, …) resolved by the system DNS".into());
+    route_rules.push(json!({"ip_is_private": true, "action": "route", "outbound": "DIRECT"}));
+    rule_origins.push("(cproxy) mode global: LAN / private addresses → DIRECT".into());
+    Ok((proxy.clone(), format!("(cproxy) mode global: everything else → {proxy} ([Rule] is not executed)")))
+}
+
+/// [Rule] → `route.rules` (порядок и семантика: ARCHITECTURE.md §3) и `route.final`: (тег, происхождение).
+fn conf_rules(
+    doc: &Document,
+    conv: &mut rules::Converter,
+    ctx: &mut Ctx,
+    route_rules: &mut Vec<Value>,
+    rule_origins: &mut Vec<String>,
+) -> Result<(String, String), ParseError> {
     let mut explicit = Vec::new();
     let mut late = Vec::new();
     let mut final_action = None;
@@ -451,16 +568,6 @@ pub fn generate(doc: &Document, res: &dyn Resources, opts: &Options) -> Result<O
                 ctx.warnings.push(format!("[Rule] line {line}: {e}; rule skipped"))
             }
         }
-    }
-    // sniff — аналог extended-matching Shadowrocket (домен из SNI/Host); hijack-dns — DNS-запросы,
-    // пришедшие как трафик (важно для TUN). Оба не мешают mixed-inbound.
-    let mut route_rules = vec![json!({"action": "sniff"}), json!({"protocol": "dns", "action": "hijack-dns"})];
-    let mut rule_origins = vec!["(cproxy) sniff: domain from TLS SNI / HTTP Host".to_string(), "(cproxy) hijack-dns".to_string()];
-    // TUN ловит и трафик самого Xray до его серверов: без этого правила — петля (Xray → TUN → sing-box →
-    // узел-socks → Xray). sing-box свои соединения защищает сам (auto_detect_interface).
-    if opts.tun && !xray_cfg.is_empty() {
-        route_rules.push(json!({"process_name": ["xray.exe", "xray"], "action": "route", "outbound": "DIRECT"}));
-        rule_origins.push("(cproxy) TUN: Xray's own connections go direct (loop protection)".into());
     }
     // Один `resolve` перед первым IP-правилом без no-resolve: домен в Destination сохраняется
     // (route.go::actionResolve), поэтому прокси-узлы по-прежнему резолвят удалённо.
@@ -533,59 +640,7 @@ pub fn generate(doc: &Document, res: &dyn Resources, opts: &Options) -> Result<O
             "DIRECT".into()
         }
     };
-    ctx.warnings.extend(conv.warnings);
-
-    // Шаг 4. DNS (dns.rs, ARCHITECTURE.md §4) и сборка итогового JSON.
-    let dns = dns::build(doc, &ctx.tags, &mut ctx.warnings, opts.tun);
-    let mut route = Map::new();
-    route.insert("rules".into(), route_rules.into());
-    if !conv.rule_sets.is_empty() {
-        route.insert("rule_set".into(), conv.rule_sets.into());
-    }
-    route.insert("final".into(), final_tag.into());
-    route.insert("default_domain_resolver".into(), dns.domain_resolver.into());
-    if opts.tun {
-        // Исходящие соединения sing-box привязываются к физическому интерфейсу, а не к своему TUN.
-        route.insert("auto_detect_interface".into(), true.into());
-    }
-    if let Some(mark) = opts.fwmark {
-        // Конфликтует только с tun.auto_redirect (common/dialer/default.go:261), его не используем.
-        route.insert("default_mark".into(), mark.into());
-    }
-
-    // Логи sing-box идут в stderr без метки времени: cli ставит свою и пишет в общий файл.
-    let log = match &opts.log_level {
-        Some(level) => json!({"level": level}),
-        None => json!({"disabled": true}),
-    };
-    let (mut inbounds, mut listeners, inbound_list) = listeners(doc, opts, &mut ctx.warnings);
-    if opts.tun {
-        inbounds.push(tun_inbound(doc, &opts.tun_exclude, &mut ctx.warnings));
-        listeners.push(format!("tun {TUN_NAME}{}", if dns.fakeip { " (fake-ip)" } else { "" }));
-    }
-    log::debug!(target: "gen::listen", "inbounds: {listeners:?}");
-    let mut config = json!({
-        "log": log,
-        "dns": dns.config,
-        "inbounds": inbounds,
-        "outbounds": outbounds,
-        "route": route,
-    });
-    if !endpoints.is_empty() {
-        config["endpoints"] = endpoints.into();
-    }
-    if let Some((addr, secret)) = &opts.clash_api {
-        config["experimental"] = json!({"clash_api": {"external_controller": addr, "secret": secret}});
-    }
-    for w in &ctx.warnings {
-        log::warn!(target: "gen", "{w}");
-    }
-    log::debug!(target: "gen", "done: {} outbounds, {} route rules, {} warnings", config["outbounds"].as_array().map_or(0, Vec::len), rule_origins.len(), ctx.warnings.len());
-    let xray = (!xray_cfg.is_empty()).then(|| xray_cfg.build(opts.log_level.as_deref(), opts.fwmark));
-    if let Some(x) = &xray {
-        log::trace!(target: "gen::xray", "xray config (secrets redacted): {}", redact(x));
-    }
-    Ok(Output { config, warnings: ctx.warnings, rule_origins, final_origin, listeners, inbounds: inbound_list, xray })
+    Ok((final_tag, final_origin))
 }
 
 /// Узлы из `[Proxy]` документа правил.

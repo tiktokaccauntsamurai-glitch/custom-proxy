@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core-model", "crates/fmt-shadowrocket", "crates/fmt-nodes", "crates/singbox-gen", "crates/supervisor", "crates/cli"]
 
 [workspace.package]
-version = "0.1.0-dev"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 

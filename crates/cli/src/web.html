@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cproxy</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1c2330;--mut:#667085;--line:#e3e6ec;--acc:#2563eb;--accfg:#fff;--ok:#16a34a;--warn:#b45309;--err:#dc2626;--code:#f1f3f7;--logbg:#0f1520;--logfg:#d6deeb}
+@media(prefers-color-scheme:dark){:root{--bg:#10141b;--card:#171d27;--fg:#e6eaf2;--mut:#93a0b5;--line:#2a3342;--acc:#5b8cff;--accfg:#0b1020;--ok:#4ade80;--warn:#fbbf24;--err:#f87171;--code:#202938;--logbg:#0a0e15}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+header h1{font-size:16px;margin:0}
+header .dev{font-size:11px;color:var(--warn);border:1px solid var(--warn);border-radius:4px;padding:0 5px}
+nav{display:flex;gap:4px;flex-wrap:wrap}
+nav button{background:none;border:0;color:var(--mut);padding:6px 12px;border-radius:6px;font:inherit;cursor:pointer}
+nav button.on{background:var(--acc);color:var(--accfg)}
+#pill{margin-left:auto;font-size:12px;color:var(--mut)}
+#pill i{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--mut);margin-right:6px}
+#pill.up i{background:var(--ok)}
+main{max-width:1100px;margin:0 auto;padding:16px}
+section{display:none}section.on{display:block}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.card h2{font-size:14px;margin:0 0 10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:4px 10px}
+.kv dt{color:var(--mut)}.kv dd{margin:0;word-break:break-all}
+label{display:block;margin:8px 0 3px;color:var(--mut);font-size:12px}
+input[type=text],input[type=number],select{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.row>*{flex:0 0 auto}.row>.grow{flex:1 1 160px}
+button.b{padding:7px 14px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);font:inherit;cursor:pointer}
+button.b.p{background:var(--acc);border-color:var(--acc);color:var(--accfg)}
+button.b.d{color:var(--err)}
+button.b:disabled{opacity:.5;cursor:default}
+.chk{display:inline-flex;align-items:center;gap:5px;margin:0 10px 0 0;color:var(--fg);font-size:13px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500;font-size:12px}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+code,.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+code{background:var(--code);padding:1px 5px;border-radius:4px}
+.msg{padding:8px 12px;border-radius:6px;margin:8px 0;background:var(--code)}
+.msg.err{color:var(--err)}.msg.ok{color:var(--ok)}.msg.warn{color:var(--warn)}
+.muted{color:var(--mut)}
+#logbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+#logbar select,#logbar input[type=text]{width:auto}
+#log{background:var(--logbg);color:var(--logfg);border-radius:8px;padding:8px 10px;height:calc(100vh - 230px);min-height:260px;overflow:auto;font:12px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+#log div.TRACE{color:#7d8ba1}#log div.DEBUG{color:#9fb0c8}#log div.INFO{color:var(--logfg)}#log div.WARN{color:#fbbf24}#log div.ERROR{color:#f87171;font-weight:600}
+.link{display:flex;gap:14px;align-items:flex-start;margin:10px 0;flex-wrap:wrap}
+.link img{width:160px;height:160px;border-radius:6px;border:1px solid var(--line);image-rendering:pixelated}
+.link .t{flex:1 1 260px;min-width:0}
+.link textarea{width:100%;height:70px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;font:12px ui-monospace,Consolas,monospace;padding:6px}
+#toast{position:fixed;right:16px;bottom:16px;max-width:420px;padding:10px 14px;border-radius:8px;background:var(--fg);color:var(--bg);display:none;z-index:9}
+</style>
+</head>
+<body>
+<header>
+  <h1>cproxy</h1><span class="dev">dev</span>
+  <nav id="nav"></nav>
+  <div id="pill"><i></i><span>…</span></div>
+</header>
+<main>
+<section id="s-overview"></section>
+<section id="s-logs">
+  <div id="logbar">
+    <select id="l-file" title="Файл лога"></select>
+    <select id="l-level" title="Минимальный уровень">
+      <option value="0">все</option><option value="1">debug+</option><option value="2">info+</option><option value="3">warn+</option><option value="4">error</option>
+    </select>
+    <input type="text" id="l-q" placeholder="поиск (подстрока)" class="grow">
+    <label class="chk"><input type="checkbox" id="l-pause">пауза</label>
+    <label class="chk"><input type="checkbox" id="l-auto" checked>вниз</label>
+    <button class="b" id="l-clear">очистить</button>
+    <span class="muted" id="l-info"></span>
+  </div>
+  <div id="log"></div>
+</section>
+<section id="s-out"></section>
+<section id="s-in"></section>
+</main>
+<div id="toast"></div>
+<script>
+'use strict';
+const TOKEN = location.hash.slice(1);
+const $ = s => document.querySelector(s);
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'class') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (v === true) e.setAttribute(k, '');
+    else if (v !== false && v != null) e.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return e;
+}
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: {'X-Token': TOKEN, 'Content-Type': 'application/json'},
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({error: 'некорректный ответ'}));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+let toastTimer;
+function toast(text, err) {
+  const t = $('#toast');
+  t.textContent = text; t.style.display = 'block'; t.style.background = err ? 'var(--err)' : '';
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.style.display = 'none', err ? 8000 : 4000);
+}
+async function act(fn, okText) {
+  try { const r = await fn(); if (okText) toast(okText); return r; }
+  catch (e) { toast(e.message, true); throw e; }
+}
+const human = b => b < 1024 ? b + ' Б' : b < 1048576 ? (b / 1024).toFixed(1) + ' КБ' : b < 1073741824 ? (b / 1048576).toFixed(1) + ' МБ' : (b / 1073741824).toFixed(2) + ' ГБ';
+const dur = s => Math.floor(s / 3600) + 'ч ' + String(Math.floor(s / 60) % 60).padStart(2, '0') + 'м';
+const kv = rows => el('dl', {class: 'kv'}, rows.filter(Boolean).flatMap(([k, v]) => [el('dt', {}, k), el('dd', {}, v)]));
+
+// ---- вкладки ----
+const TABS = [['overview', 'Обзор'], ['logs', 'Логи'], ['out', 'Исходящие'], ['in', 'Входящие']];
+let tab = 'overview', S = null;
+TABS.forEach(([id, name]) => $('#nav').append(el('button', {id: 'tab-' + id, onclick: () => show(id)}, name)));
+function show(id) {
+  tab = id;
+  for (const [t] of TABS) { $('#tab-' + t).classList.toggle('on', t === id); $('#s-' + t).classList.toggle('on', t === id); }
+  if (id === 'logs') logPoll(true);
+  render();
+}
+
+async function refresh() {
+  try { S = await api('/api/state'); } catch (e) { $('#pill span').textContent = e.message; return; }
+  const up = !!S.run;
+  $('#pill').classList.toggle('up', up);
+  $('#pill span').textContent = up ? 'запущен, pid ' + S.run.pid : 'не запущен';
+  // Формы перерисовываются только когда данные изменились: иначе введённый, но не сохранённый текст пропадал бы.
+  const sig = JSON.stringify([S.settings, S.server, S.service, S.live && S.live.groups, !!S.run]);
+  const changed = sig !== lastSig;
+  lastSig = sig;
+  if (tab === 'overview' || (changed && !editing())) render();
+}
+let lastSig = '';
+// Не перерисовывать форму, пока пользователь в ней печатает.
+function editing() { const a = document.activeElement; return a && a.closest && a.closest('main') && /INPUT|SELECT|TEXTAREA/.test(a.tagName) && tab !== 'overview' && tab !== 'logs'; }
+function render() {
+  if (!S) return;
+  if (tab === 'overview') renderOverview();
+  else if (tab === 'out') renderOut();
+  else if (tab === 'in') renderIn();
+}
+
+// ---- обзор ----
+function renderOverview() {
+  const root = $('#s-overview'), r = S.run, L = S.live, srv = S.server;
+  const cards = [];
+  cards.push(el('div', {class: 'card'}, el('h2', {}, 'Экземпляр'), r ? kv([
+    ['состояние', 'работает ' + dur(r.uptime)], ['pid', r.pid], ['слушает', r.listeners.join(', ')],
+    ['ядра', r.cores.map(c => c.name + ' (' + c.pid + ')').join(', ')], ['лог', r.log || 'выключен'],
+  ]) : el('p', {class: 'muted'}, 'cproxy не запущен. Клиент: cproxy run, сервер: cproxy run --server.')));
+  cards.push(el('div', {class: 'card'}, el('h2', {}, 'Система'), kv([
+    ['версия', S.version], ['ОС', S.os], ['каталог данных', S.data_dir],
+    ['служба systemd', S.service.installed ? 'установлена' : S.service.systemd ? 'не установлена' : 'недоступна'],
+  ])));
+  if (L && !L.error) {
+    cards.push(el('div', {class: 'card'}, el('h2', {}, 'Трафик с запуска'), kv([
+      ['отдано ↑', human(L.up)], ['получено ↓', human(L.down)], ['соединений', L.connections],
+    ])));
+  } else if (L) cards.push(el('div', {class: 'card'}, el('h2', {}, 'Живые данные'), el('div', {class: 'msg warn'}, L.error)));
+  const top = el('div', {class: 'grid'}, cards);
+  root.replaceChildren(top);
+  if (L && L.users && L.users.length && srv.configured) {
+    root.append(el('div', {class: 'card'}, el('h2', {}, 'Устройства (активные соединения)'),
+      el('table', {}, el('tr', {}, el('th', {}, 'пользователь'), el('th', {class: 'n'}, 'соед.'), el('th', {class: 'n'}, '↑'), el('th', {class: 'n'}, '↓')),
+        L.users.map(u => el('tr', {}, el('td', {}, u.name), el('td', {class: 'n'}, u.conns), el('td', {class: 'n'}, human(u.up)), el('td', {class: 'n'}, human(u.down)))))));
+  }
+}
+
+// ---- логи ----
+const LV = {TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4};
+let logLines = [], logFile = '', logLatest = '', logOff = null, logBusy = false, logFollow = true;
+const LOG_MAX = 5000;
+function parseLine(t) { const m = /^\S+\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s/.exec(t); return {t, lv: m ? m[1] : 'INFO'}; }
+function logPass(l) {
+  if (LV[l.lv] < +$('#l-level').value) return false;
+  const q = $('#l-q').value.toLowerCase();
+  return !q || l.t.toLowerCase().includes(q);
+}
+function logDiv(l) { return el('div', {class: l.lv}, l.t); }
+function logRedraw() {
+  const box = $('#log');
+  box.replaceChildren(...logLines.filter(logPass).map(logDiv));
+  if ($('#l-auto').checked) box.scrollTop = box.scrollHeight;
+  $('#l-info').textContent = box.childElementCount + ' / ' + logLines.length + ' строк';
+}
+async function logPoll(force) {
+  if (logBusy || (tab !== 'logs') || (!force && $('#l-pause').checked)) return;
+  logBusy = true;
+  try {
+    const q = new URLSearchParams({follow: logFollow ? '1' : '0'});
+    if (logFile) q.set('file', logFile);
+    if (logOff != null) q.set('offset', logOff);
+    const r = await api('/api/logs?' + q);
+    const sel = $('#l-file');
+    if (sel.dataset.sig !== JSON.stringify(r.files.map(f => f.name))) {
+      sel.dataset.sig = JSON.stringify(r.files.map(f => f.name));
+      sel.replaceChildren(...r.files.map(f => el('option', {value: f.name}, f.name.replace(/^cproxy-/, '').replace(/\.log$/, '') + (f.name === r.latest ? ' (новый)' : ''))));
+    }
+    if (!r.file) { $('#l-info').textContent = 'логов нет: включите debug (cproxy set debug on) и запустите cproxy'; return; }
+    if (r.file !== logFile || r.reset) { logLines = []; }
+    logFile = r.file; logLatest = r.latest; sel.value = r.file; logOff = r.offset;
+    const add = r.text ? r.text.split('\n').filter(Boolean).map(parseLine) : [];
+    if (add.length) {
+      logLines.push(...add);
+      if (logLines.length > LOG_MAX) logLines.splice(0, logLines.length - LOG_MAX);
+      if (r.reset) logRedraw();
+      else {
+        const box = $('#log');
+        add.filter(logPass).forEach(l => box.append(logDiv(l)));
+        while (box.childElementCount > LOG_MAX) box.firstChild.remove();
+        if ($('#l-auto').checked) box.scrollTop = box.scrollHeight;
+        $('#l-info').textContent = box.childElementCount + ' / ' + logLines.length + ' строк';
+      }
+    } else if (r.reset) logRedraw();
+  } catch (e) { $('#l-info').textContent = e.message; }
+  finally { logBusy = false; }
+}
+$('#l-file').addEventListener('change', e => { logFile = e.target.value; logFollow = e.target.value === logLatest; logOff = null; logLines = []; logPoll(true); });
+$('#l-level').addEventListener('change', logRedraw);
+$('#l-q').addEventListener('input', logRedraw);
+$('#l-clear').addEventListener('click', () => { logLines = []; logRedraw(); });
+$('#l-auto').addEventListener('change', () => { if ($('#l-auto').checked) { const b = $('#log'); b.scrollTop = b.scrollHeight; } });
+
+// ---- исходящие ----
+let nodesCache = null;
+function renderOut() {
+  const s = S.settings, root = $('#s-out');
+  const f = {};
+  const text = (key, label, val, ph) => el('div', {}, el('label', {}, label), f[key] = el('input', {type: 'text', value: val || '', placeholder: ph || '', autocomplete: 'off', spellcheck: 'false'}));
+  const chk = (key, label, val) => el('label', {class: 'chk'}, f[key] = el('input', {type: 'checkbox', checked: !!val}), label);
+  const mode = el('select', {}, s.nodes_modes.split('|').map(m => el('option', {value: m, selected: m === s.nodes}, m)));
+  const MODES = {rules: 'rules — правила .conf', global: 'global — всё через PROXY, LAN напрямую', strict: 'strict — global + TUN + kill switch'};
+  const route = el('select', {}, s.modes.split('|').map(m => el('option', {value: m, selected: m === s.mode}, MODES[m] || m)));
+  const save = el('button', {class: 'b p', onclick: async () => {
+    const body = {mode: route.value, nodes: mode.value, system_proxy: f.system_proxy.checked, tun: f.tun.checked, debug: f.debug.checked, kill_switch: f.kill_switch.checked};
+    if (f.rules.value !== (s.rules || '')) body.rules = f.rules.value;
+    // Подписка показывается скрытой (https://host/***): отправляется только то, что пользователь ввёл заново.
+    if (f.connection.value !== (s.connection || '')) body.connection = f.connection.value;
+    const r = await act(() => api('/api/settings', body));
+    toast(r.apply || r.note); refresh();
+  }}, 'Сохранить');
+  root.replaceChildren(
+    el('div', {class: 'grid'},
+      el('div', {class: 'card'}, el('h2', {}, 'Подключение и правила'),
+        text('connection', 'Подключение: файл или URL подписки' + (s.connection_is_url ? ' (сохранён URL, токен скрыт)' : ''), s.connection, 'пусто — не задано'),
+        text('rules', 'Правила: файл .conf Shadowrocket', s.rules, 'пусто — не задано'),
+        el('label', {}, 'Чьи узлы использовать'), mode,
+        el('p', {class: 'muted'}, 'Подписка живёт только в памяти; на диске хранится URL.')),
+      el('div', {class: 'card'}, el('h2', {}, 'Режимы клиента'),
+        el('label', {}, 'Маршрутизация'), route,
+        el('p', {class: 'muted'}, 'strict: сервер недоступен — интернета нет; TUN и kill switch включаются сами (нужны права).'),
+        chk('system_proxy', 'системный прокси', s.system_proxy), chk('tun', 'TUN (весь трафик, нужны права)', s.tun),
+        el('br'), chk('kill_switch', 'kill switch', s.kill_switch), chk('debug', 'debug-лог (trace) в файл', s.debug),
+        el('div', {class: 'row', style: 'margin-top:14px'}, save),
+        el('p', {class: 'muted'}, 'Изменения вступают в силу при следующем запуске cproxy.'))),
+    el('div', {class: 'card'}, el('h2', {}, 'Узлы подключения'),
+      el('div', {class: 'row'}, el('button', {class: 'b', onclick: loadNodes}, 'Загрузить список'), el('span', {class: 'muted', id: 'nodes-info'}, nodesCache ? nodesCache.length + ' узл.' : 'с подпиской скачивает её в память')),
+      el('div', {id: 'nodes-box'}, nodesTable())),
+    groupsCard());
+}
+function nodesTable() {
+  if (!nodesCache) return '';
+  if (!nodesCache.length) return el('p', {class: 'muted'}, 'узлов нет');
+  return el('table', {}, el('tr', {}, el('th', {}, 'имя'), el('th', {}, 'тип'), el('th', {}, 'сервер'), el('th', {}, 'ядро')),
+    nodesCache.map(n => el('tr', {}, el('td', {}, n.name), el('td', {}, n.kind), el('td', {class: 'mono'}, n.server + ':' + n.port), el('td', {}, n.xray ? 'Xray' : 'sing-box'))));
+}
+async function loadNodes() {
+  const r = await act(() => api('/api/nodes'));
+  nodesCache = r.nodes; $('#nodes-box').replaceChildren(nodesTable()); $('#nodes-info').textContent = nodesCache.length + ' узл.';
+}
+function groupsCard() {
+  const L = S.live;
+  const card = el('div', {class: 'card'}, el('h2', {}, 'Группы запущенного экземпляра'));
+  if (!L || L.error || !L.groups || !L.groups.length) {
+    card.append(el('p', {class: 'muted'}, S.run ? (L && L.error) || 'групп нет' : 'cproxy не запущен — групп нет.'));
+    return card;
+  }
+  for (const g of L.groups) {
+    const sel = g.kind === 'Selector';
+    const out = el('span', {class: 'muted mono'});
+    const pick = el('select', {class: 'grow', disabled: !sel, onchange: async e => { await act(() => api('/api/select', {group: g.name, node: e.target.value}), g.name + ' → ' + e.target.value); refresh(); }},
+      g.all.map(n => el('option', {value: n, selected: n === g.now}, n)));
+    card.append(el('div', {class: 'row', style: 'margin:6px 0'}, el('b', {style: 'min-width:110px'}, g.name), el('span', {class: 'muted'}, sel ? 'select' : g.kind === 'URLTest' ? 'url-test' : g.kind),
+      sel ? pick : el('span', {class: 'grow'}, '→ ' + g.now),
+      el('button', {class: 'b', onclick: async () => {
+        out.textContent = 'проверяю…';
+        const r = await act(() => api('/api/test', {group: g.name}));
+        out.textContent = Object.entries(r.delays).filter(([, v]) => v > 0).sort((a, b) => a[1] - b[1]).slice(0, 5).map(([k, v]) => v + ' мс ' + k).join(' · ') || 'нет связи';
+        refresh();
+      }}, 'задержки'), out));
+  }
+  return card;
+}
+
+// ---- входящие ----
+const shown = {};
+let lastNote = '';
+function renderIn() {
+  const srv = S.server, root = $('#s-in');
+  if (!srv.configured) return renderInit(root);
+  const f = {};
+  const note = el('div', {id: 'in-note'}, lastNote ? el('div', {class: 'msg warn'}, lastNote) : null);
+  const inp = (k, label, v, type) => el('div', {}, el('label', {}, label), f[k] = el('input', {type: type || 'text', value: v, autocomplete: 'off', spellcheck: 'false'}));
+  const applyMsg = r => { if (r.apply) { lastNote = r.apply; note.replaceChildren(el('div', {class: 'msg warn'}, r.apply)); } };
+  const exitsOf = d => d.exits.map(e => e.id);
+  root.replaceChildren(
+    el('div', {class: 'grid'},
+      el('div', {class: 'card'}, el('h2', {}, 'Вход: ' + srv.protocol_title),
+        inp('host', 'Адрес для телефона (домен или IP)', srv.host), inp('port', 'Порт', srv.port, 'number'),
+        srv.needs_mask ? inp('mask', 'Сайт-маска REALITY (проверяется: TLS 1.3 + X25519 + h2)', srv.mask) : (f.mask = {value: ''}, null),
+        el('div', {class: 'row', style: 'margin-top:12px'}, el('button', {class: 'b p', onclick: async e => {
+          e.target.disabled = true;
+          try {
+            const r = await act(() => api('/api/server/params', {host: f.host.value, port: +f.port.value, mask: f.mask.value}));
+            toast(r.changes.length ? r.changes.join('; ') : 'без изменений'); applyMsg(r); refresh();
+          } finally { e.target.disabled = false; }
+        }}, 'Сохранить'), el('span', {class: 'muted'}, 'смена маски проверяется по сети — до нескольких секунд')),
+        el('p', {class: 'muted'}, 'Слушает [', srv.listen, ']:', srv.port, '. После смены порта или адреса ссылки на телефонах нужно обновить.')),
+      el('div', {class: 'card'}, el('h2', {}, 'Ключи (без секретов)'), kv([['public key', srv.public_key], ['short id', srv.short_id]]),
+        S.service.installed ? el('div', {class: 'row', style: 'margin-top:12px'}, el('button', {class: 'b', onclick: async () => { const r = await act(() => api('/api/service/sync', {})); note.replaceChildren(el('div', {class: 'msg'}, r.apply)); }}, 'Применить к службе')) : null,
+        note)),
+    el('div', {class: 'card'}, el('h2', {}, 'Устройства'), devicesTable(srv, exitsOf, applyMsg), addDevice(srv, applyMsg)));
+}
+function renderInit(root) {
+  const host = el('input', {type: 'text', placeholder: 'home.example.net или белый IP'}), port = el('input', {type: 'number', value: 443}), mask = el('input', {type: 'text', placeholder: 'пусто — самый быстрый из проверенных'});
+  const proto = el('select', {}, (S.server.protocols || []).map(p => el('option', {value: p.id}, p.title)));
+  root.replaceChildren(el('div', {class: 'card', style: 'max-width:560px'}, el('h2', {}, 'Сервер не настроен'),
+    el('label', {}, 'Тип входа (протокол телефон → дом; выходы от него не зависят)'), proto,
+    el('label', {}, 'Адрес для телефона'), host, el('label', {}, 'Порт'), port, el('label', {}, 'Сайт-маска REALITY'), mask,
+    el('div', {class: 'row', style: 'margin-top:12px'}, el('button', {class: 'b p', onclick: async e => {
+      e.target.disabled = true; toast('создаю ключи, проверяю маску…');
+      try { await act(() => api('/api/server/init', {protocol: proto.value, host: host.value, port: +port.value, mask: mask.value}), 'сервер настроен'); refresh(); } finally { e.target.disabled = false; }
+    }}, 'Создать ключи'))));
+}
+function devicesTable(srv, exitsOf, applyMsg) {
+  if (!srv.devices.length) return el('p', {class: 'muted'}, 'устройств нет — добавьте первое ниже');
+  const wrap = el('div');
+  for (const d of srv.devices) {
+    const boxes = srv.exits.map(x => el('label', {class: 'chk'}, el('input', {type: 'checkbox', value: x.id, checked: exitsOf(d).includes(x.id)}), x.node));
+    const links = el('div');
+    wrap.append(el('div', {style: 'border-top:1px solid var(--line);padding:10px 0'},
+      el('div', {class: 'row'}, el('b', {style: 'min-width:100px'}, d.name), boxes,
+        el('button', {class: 'b', onclick: async () => {
+          const ex = boxes.map(b => b.firstChild).filter(c => c.checked).map(c => c.value);
+          const r = await act(() => api('/api/server/device', {name: d.name, exits: ex}), 'выходы сохранены'); applyMsg(r); refresh();
+        }}, 'сохранить выходы'),
+        el('button', {class: 'b', onclick: async () => { shown[d.name] = !shown[d.name]; if (shown[d.name]) await showLinks(d, links); else links.replaceChildren(); }}, 'ссылки / QR'),
+        el('button', {class: 'b d', onclick: async () => {
+          if (!confirm('Удалить устройство ' + d.name + '? Его ссылки перестанут работать.')) return;
+          const r = await act(() => api('/api/server/device/remove', {name: d.name}), 'удалено'); applyMsg(r); refresh();
+        }}, 'удалить')),
+      links));
+    if (shown[d.name]) showLinks(d, links);
+  }
+  return wrap;
+}
+async function showLinks(d, box) {
+  box.replaceChildren();
+  for (const x of d.exits) {
+    try {
+      const r = await api('/api/server/link?device=' + encodeURIComponent(d.name) + '&exit=' + x.id);
+      box.append(el('div', {class: 'link'}, el('img', {alt: 'QR', src: 'data:image/svg+xml;utf8,' + encodeURIComponent(r.qr_svg)}),
+        el('div', {class: 't'}, el('b', {}, r.node), el('div', {class: 'muted'}, 'Shadowrocket: «+» → сканер, или скопируйте ссылку'),
+          el('textarea', {readonly: true, onfocus: e => e.target.select()}, r.link),
+          el('button', {class: 'b', onclick: () => navigator.clipboard.writeText(r.link).then(() => toast('скопировано'), () => toast('не удалось скопировать', true))}, 'копировать'))));
+    } catch (e) { box.append(el('div', {class: 'msg err'}, x.node + ': ' + e.message)); }
+  }
+}
+function addDevice(srv, applyMsg) {
+  const name = el('input', {type: 'text', placeholder: 'iphone', style: 'max-width:200px'});
+  const boxes = srv.exits.map(x => el('label', {class: 'chk'}, el('input', {type: 'checkbox', value: x.id, checked: x.id !== 'lan'}), x.node));
+  return el('div', {style: 'border-top:1px solid var(--line);padding-top:12px;margin-top:6px'}, el('div', {class: 'row'}, el('b', {}, 'Новое:'), name, boxes,
+    el('button', {class: 'b p', onclick: async () => {
+      const ex = boxes.map(b => b.firstChild).filter(c => c.checked).map(c => c.value);
+      const r = await act(() => api('/api/server/device', {name: name.value.trim(), exits: ex}), 'устройство добавлено'); applyMsg(r); shown[name.value.trim()] = true; refresh();
+    }}, 'добавить')),
+    el('p', {class: 'muted'}, 'ru — выход с домашнего IP · vps — через узлы подключения · lan — только домашняя сеть. Имя: латиница, цифры, - и _.'));
+}
+
+// ---- запуск ----
+if (!TOKEN) {
+  document.body.prepend(el('div', {class: 'msg err', style: 'margin:16px'}, 'Нет токена. Откройте адрес целиком, как его печатает `cproxy web` (с #…).'));
+}
+show('overview');
+refresh();
+setInterval(refresh, 5000);
+setInterval(() => logPoll(false), 1500);
+</script>
+</body>
+</html>

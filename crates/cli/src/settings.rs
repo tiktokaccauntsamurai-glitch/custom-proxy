@@ -9,6 +9,7 @@
 //! - `tun` — режим TUN: весь трафик системы через правила (по умолчанию нет, нужны права администратора);
 //! - `selections` — выбор узлов в группах select (`cproxy select`), применяется при следующем запуске;
 //! - `kill_switch` — блок всего, кроме ядер, пока запущен cproxy (killswitch.rs, по умолчанию нет);
+//! - `mode` — маршрутизация: [`Mode`] (rules / global / strict; ARCHITECTURE.md §21);
 //! - `debug` — полный лог (trace) в `<data>/logs` при каждом запуске (по умолчанию нет; main.rs::file_level).
 //! Читает/пишет `main.rs` (команды `set`, `status`, запуск без аргументов, перетаскивание файла).
 
@@ -53,6 +54,45 @@ impl NodesMode {
     }
 }
 
+/// Режим маршрутизации (`cproxy set mode`, `--mode`; решение пользователя 2026-11-16, ARCHITECTURE.md §21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Правила `.conf` (как «Конфигурация» в Shadowrocket).
+    #[default]
+    Rules,
+    /// Весь трафик и DNS через PROXY, правила не исполняются, напрямую только локальная сеть
+    /// (как «Прокси» в Shadowrocket). Захват — как настроено: системный прокси или TUN.
+    Global,
+    /// Global + TUN + kill switch: сервер недоступен или ядро упало — интернета нет, ничего не уходит мимо.
+    Strict,
+}
+
+impl Mode {
+    pub const NAMES: &'static str = "rules|global|strict";
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "rules" | "config" => Self::Rules,
+            "global" | "proxy" => Self::Global,
+            "strict" => Self::Strict,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Rules => "rules",
+            Self::Global => "global",
+            Self::Strict => "strict",
+        }
+    }
+
+    /// Правила .conf не исполняются, всё через PROXY (`singbox_gen::Options::global`).
+    pub fn global(self) -> bool {
+        self != Self::Rules
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub rules: Option<String>,
@@ -65,11 +105,13 @@ pub struct Settings {
     pub selections: std::collections::BTreeMap<String, String>,
     /// Kill switch: пока запущен cproxy, в интернет ходят только ядра (killswitch.rs). По умолчанию выключен.
     pub kill_switch: bool,
+    /// Маршрутизация: правила / глобальный / строгий. По умолчанию правила.
+    pub mode: Mode,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { rules: None, connection: None, nodes: NodesMode::Auto, system_proxy: true, tun: false, debug: false, selections: Default::default(), kill_switch: false }
+        Settings { rules: None, connection: None, nodes: NodesMode::Auto, system_proxy: true, tun: false, debug: false, selections: Default::default(), kill_switch: false, mode: Mode::Rules }
     }
 }
 
@@ -100,16 +142,17 @@ impl Settings {
             tun: v["tun"].as_bool().unwrap_or(false),
             debug: v["debug"].as_bool().unwrap_or(false),
             kill_switch: v["kill_switch"].as_bool().unwrap_or(false),
+            mode: v["mode"].as_str().and_then(Mode::parse).unwrap_or_default(),
             selections: v["selections"].as_object().map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default(),
         };
-        log::debug!(target: "settings", "loaded {}: rules={:?} connection={:?} nodes={} system_proxy={} tun={} debug={}", p.display(), me.rules, me.connection.as_deref().map(redact_source), me.nodes.name(), me.system_proxy, me.tun, me.debug);
+        log::debug!(target: "settings", "loaded {}: rules={:?} connection={:?} nodes={} system_proxy={} tun={} debug={} kill_switch={} mode={}", p.display(), me.rules, me.connection.as_deref().map(redact_source), me.nodes.name(), me.system_proxy, me.tun, me.debug, me.kill_switch, me.mode.name());
         me
     }
 
     pub fn save(&self) -> Result<(), String> {
         let p = path();
         std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-        let v = json!({"rules": self.rules, "connection": self.connection, "nodes": self.nodes.name(), "system_proxy": self.system_proxy, "tun": self.tun, "debug": self.debug, "selections": self.selections, "kill_switch": self.kill_switch});
+        let v = json!({"rules": self.rules, "connection": self.connection, "nodes": self.nodes.name(), "system_proxy": self.system_proxy, "tun": self.tun, "debug": self.debug, "selections": self.selections, "kill_switch": self.kill_switch, "mode": self.mode.name()});
         std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).map_err(|e| format!("{}: {e}", p.display()))?;
         log::info!(target: "settings", "saved {}", p.display());
         Ok(())
@@ -120,9 +163,15 @@ impl Settings {
         println!("connection  {}", self.connection.as_deref().map(redact_source).unwrap_or("-".into()));
         println!("nodes       {}", self.nodes.name());
         println!("sys-proxy   {}", if self.system_proxy { "on (off while TUN is on)" } else { "off" });
-        println!("tun         {}", if self.tun { "on" } else { "off" });
+        println!("mode        {}", match self.mode {
+            Mode::Rules => "rules (.conf rules)",
+            Mode::Global => "global (everything via PROXY, LAN direct; rules not executed)",
+            Mode::Strict => "strict (global + TUN + kill switch: no internet without the server)",
+        });
+        let forced = if self.mode == Mode::Strict { " (forced on by mode strict)" } else { "" };
+        println!("tun         {}{}", if self.tun { "on" } else { "off" }, forced);
         println!("debug       {}", if self.debug { "on (full log in <data>/logs)" } else { "off" });
-        println!("kill-switch {}", if self.kill_switch { "on (only cores reach the internet while cproxy runs)" } else { "off" });
+        println!("kill-switch {}{}", if self.kill_switch { "on (only cores reach the internet while cproxy runs)" } else { "off" }, forced);
         println!("file        {}", path().display());
     }
 }

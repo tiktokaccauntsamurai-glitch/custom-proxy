@@ -20,6 +20,7 @@ mod service;
 mod settings;
 mod store;
 mod sysproxy;
+mod web;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ExitCode, Stdio};
@@ -29,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use core_model::Node;
 use log::{Level, LevelFilter};
-use settings::{NodesMode, Settings};
+use settings::{Mode, NodesMode, Settings};
 use singbox_gen::server::Exit as SrvExit;
 use store::Cache;
 use supervisor::{Exit, RunState, Service, Supervisor};
@@ -53,6 +54,11 @@ usage:
                                           если задан, иначе [Proxy] из правил)
   cproxy set system-proxy on|off          включать ли системный прокси при запуске (по умолчанию on)
   cproxy set tun on|off                   режим TUN: ВЕСЬ трафик системы через правила (админ/UAC)
+  cproxy set mode rules|global|strict     маршрутизация: rules — правила .conf (по умолчанию);
+                                          global — весь трафик и DNS через PROXY, правила не
+                                          исполняются, напрямую только локальная сеть;
+                                          strict — global + TUN + kill switch: сервер недоступен —
+                                          интернета нет, ничего не уходит мимо (админ/UAC)
   cproxy set debug on|off                 полный лог (trace) в <data>/logs при каждом запуске
   cproxy set kill-switch on|off           пока cproxy запущен, в интернет ходят только ядра: упало ядро —
                                           трафик не уходит напрямую (админ/root; по умолчанию off)
@@ -90,7 +96,13 @@ usage:
   cproxy run --server                     запустить сервер (без системного прокси и TUN)
   sudo cproxy service install [--no-debug] [--dry-run]
                                           служба systemd (Linux): автозапуск, порт 443, пользователь cproxy
+  sudo cproxy service sync                скопировать устройства/ключи в службу и перезапустить её
+                                          (после `server user add|remove` делается само)
   sudo cproxy service uninstall [--purge] | cproxy service status
+
+веб-страница (dev): логи, исходящие и входящие подключения, docs/WEB.md:
+  cproxy web [--port N]                   http://127.0.0.1:7899/#<токен> (токен печатается при запуске);
+                                          только loopback, на Linux-сервере: CPROXY_HOME=/var/lib/cproxy
 
 opts (без них берутся сохранённые настройки):
   --nodes FILE|URL   источник узлов на этот запуск
@@ -98,6 +110,7 @@ opts (без них берутся сохранённые настройки):
   --system-proxy / --no-system-proxy   системный прокси на этот запуск
   --tun / --no-tun   режим TUN на этот запуск (при TUN системный прокси не включается)
   --kill-switch / --no-kill-switch   kill switch на этот запуск
+  --mode M       rules|global|strict на этот запуск
   --port N       порт для программ (HTTP+SOCKS5). По умолчанию из конфига
                  ([General] http-listen / socks5-listen), иначе 7890
   --lan          слушать 0.0.0.0 (доступ из локальной сети, без пароля)
@@ -107,7 +120,7 @@ opts (без них берутся сохранённые настройки):
   -v, --verbose  подробный вывод и в консоль
 ";
 
-const COMMANDS: [&str; 14] = ["check", "fetch", "gen", "groups", "killswitch", "run", "select", "server", "service", "set", "status", "stop", "sysproxy", "test"];
+const COMMANDS: [&str; 15] = ["check", "fetch", "gen", "groups", "killswitch", "run", "select", "server", "service", "set", "status", "stop", "sysproxy", "test", "web"];
 
 struct Args {
     cmd: String,
@@ -137,6 +150,8 @@ struct Args {
     purge: bool,
     /// `--kill-switch` / `--no-kill-switch` на этот запуск.
     kill_switch: Option<bool>,
+    /// `--mode rules|global|strict` на этот запуск.
+    mode: Option<Mode>,
     /// Исходные аргументы (для UAC-перезапуска с теми же параметрами).
     argv: Vec<String>,
     force: bool,
@@ -173,6 +188,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         dry_run: false,
         purge: false,
         kill_switch: None,
+        mode: None,
         argv: argv.to_vec(),
         force: false,
         log: None,
@@ -212,6 +228,10 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--purge" => a.purge = true,
             "--kill-switch" => a.kill_switch = Some(true),
             "--no-kill-switch" => a.kill_switch = Some(false),
+            "--mode" => {
+                let m = value("--mode")?;
+                a.mode = Some(Mode::parse(&m).ok_or(format!("bad --mode `{m}` ({})", Mode::NAMES))?);
+            }
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             s => a.pos.push(s.to_string()),
         }
@@ -458,6 +478,7 @@ fn real_main(argv: &[String], interactive: bool) -> ExitCode {
         "select" => select_cmd(&args),
         "test" => test_cmd(&args),
         "service" => service_cmd(&args),
+        "web" => web::serve(args.opts.port),
         "killswitch" => killswitch_cmd(&args),
         "check" => check(&args),
         "fetch" => fetch(&args, false),
@@ -492,10 +513,18 @@ fn set(a: &Args) -> Result<ExitCode, String> {
         "tun" => s.tun = on_off(value)?,
         "debug" => s.debug = on_off(value)?,
         "kill-switch" | "killswitch" => s.kill_switch = on_off(value)?,
-        other => return Err(format!("unknown setting `{other}` (rules|connection|nodes|system-proxy|tun|debug|kill-switch)")),
+        "mode" => s.mode = Mode::parse(value).ok_or(format!("bad mode `{value}` ({})", Mode::NAMES))?,
+        other => return Err(format!("unknown setting `{other}` (rules|connection|nodes|system-proxy|tun|debug|kill-switch|mode)")),
     }
     s.save()?;
     s.print();
+    // Служба сервера держит свою копию settings.json (service::data_steps): подключение/правила/режим узлов
+    // меняются и там. Ошибка (нет server.json — это клиентская машина) не должна ронять `set`.
+    if matches!(key, "rules" | "connection" | "nodes" | "debug") && service::installed() {
+        if let Err(e) = apply_to_service() {
+            log::warn!(target: "service", "{e}");
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -507,14 +536,31 @@ fn on_off(value: &str) -> Result<bool, String> {
     }
 }
 
-/// TUN на этот запуск: флаг → настройка.
-fn tun_wanted(a: &Args) -> bool {
-    a.tun.unwrap_or_else(|| Settings::load().tun)
+/// Режим маршрутизации на этот запуск: `--mode` → настройка. Сервер всегда по своим правилам (server.rs).
+fn mode_wanted(a: &Args) -> Mode {
+    if a.server {
+        return Mode::Rules;
+    }
+    a.mode.unwrap_or_else(|| Settings::load().mode)
 }
 
-/// Kill switch на этот запуск: флаг → настройка. У сервера нет (его задача — выпускать трафик).
+/// strict держит TUN и kill switch включёнными: явное `--no-tun` / `--no-kill-switch` — противоречие, а не тихое
+/// ослабление защиты.
+fn check_mode_flags(a: &Args) -> Result<(), String> {
+    if mode_wanted(a) == Mode::Strict && (a.tun == Some(false) || a.kill_switch == Some(false)) {
+        return Err("mode strict always uses TUN and the kill switch; for global routing without them use --mode global".into());
+    }
+    Ok(())
+}
+
+/// TUN на этот запуск: strict → всегда; иначе флаг → настройка.
+fn tun_wanted(a: &Args) -> bool {
+    mode_wanted(a) == Mode::Strict || a.tun.unwrap_or_else(|| Settings::load().tun)
+}
+
+/// Kill switch на этот запуск: strict → всегда; иначе флаг → настройка. У сервера нет (его задача — выпускать трафик).
 fn kill_switch_wanted(a: &Args) -> bool {
-    !a.server && a.kill_switch.unwrap_or_else(|| Settings::load().kill_switch)
+    !a.server && (mode_wanted(a) == Mode::Strict || a.kill_switch.unwrap_or_else(|| Settings::load().kill_switch))
 }
 
 /// `cproxy killswitch status|off`.
@@ -728,6 +774,7 @@ fn options(a: &Args) -> singbox_gen::Options {
         selections: s.selections,
         // Linux: kill switch пропускает сокеты ядер по метке (killswitch.rs). Windows — по app-id, метка не нужна.
         fwmark: (cfg!(target_os = "linux") && kill_switch_wanted(a)).then_some(killswitch::FWMARK),
+        global: mode_wanted(a).global(),
     }
 }
 
@@ -880,7 +927,8 @@ fn server_init(a: &Args) -> Result<ExitCode, String> {
             k
         }
     };
-    let cfg = server::Config { host, listen: "::".into(), port, mask, devices: old.map(|c| c.devices).unwrap_or_default() };
+    let protocol = old.as_ref().map_or(server::Protocol::DEFAULT, |c| c.protocol);
+    let cfg = server::Config { protocol, host, listen: "::".into(), port, mask, devices: old.map(|c| c.devices).unwrap_or_default() };
     keys.save()?;
     cfg.save()?;
     println!();
@@ -892,59 +940,39 @@ fn server_init(a: &Args) -> Result<ExitCode, String> {
 }
 
 fn server_user_add(a: &Args, name: &str) -> Result<ExitCode, String> {
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(format!("bad device name `{name}`: use latin letters, digits, - and _"));
-    }
-    let mut cfg = server::Config::load()?;
-    let mut keys = server::Keys::load()?;
-    let mut exits = Vec::new();
-    for e in a.exits.as_deref().unwrap_or("ru,vps").split(',').map(str::trim).filter(|e| !e.is_empty()) {
-        let x = SrvExit::parse(e).ok_or(format!("bad exit `{e}` ({})", SrvExit::NAMES))?;
-        if !exits.contains(&x) {
-            exits.push(x);
-        }
-    }
-    let sing_box = sing_box_bin(a)?;
-    for x in &exits {
-        let user = server::user_name(name, *x);
-        if !keys.uuids.contains_key(&user) {
-            keys.uuids.insert(user, server::new_uuid(&sing_box)?);
-        }
-    }
-    match cfg.devices.iter_mut().find(|d| d.name == name) {
-        Some(d) => {
-            for x in exits {
-                if !d.exits.contains(&x) {
-                    d.exits.push(x);
-                }
-            }
-        }
-        None => cfg.devices.push(server::Device { name: name.to_string(), exits }),
-    }
-    keys.save()?;
-    cfg.save()?;
-    log::info!(target: "server", "device `{name}` saved");
+    server::check_device_name(name)?;
+    let exits = server::parse_exits(a.exits.as_deref().unwrap_or("ru,vps").split(','))?;
+    server::set_device(name, exits, false, &sing_box_bin(a)?)?;
     server_show()?;
     println!("\nссылки и QR: cproxy server link {name}");
-    if running() {
-        println!("сервер запущен: перезапустите его (cproxy stop, затем cproxy run --server)");
-    }
+    apply_to_service()?;
     Ok(ExitCode::SUCCESS)
 }
 
 fn server_user_remove(name: &str) -> Result<ExitCode, String> {
-    let mut cfg = server::Config::load()?;
-    let mut keys = server::Keys::load()?;
-    let Some(d) = cfg.devices.iter().position(|d| d.name == name).map(|i| cfg.devices.remove(i)) else {
-        return Err(format!("no device `{name}`"));
-    };
-    for x in SrvExit::ALL {
-        keys.uuids.remove(&server::user_name(&d.name, x));
-    }
-    keys.save()?;
-    cfg.save()?;
-    println!("устройство {name} удалено, его ссылки больше не работают{}", if running() { " (после перезапуска сервера)" } else { "" });
+    server::remove_device(name)?;
+    println!("устройство {name} удалено, его ссылки больше не работают");
+    apply_to_service()?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// После изменения устройств: установленная служба получает новые данные и перезапускается (service::sync_plan),
+/// без прав root — sudo-перезапуск `service sync`. Службы нет, но экземпляр запущен вручную — подсказка.
+fn apply_to_service() -> Result<(), String> {
+    match service::apply()? {
+        service::Applied::Synced => println!("служба обновлена и перезапущена"),
+        service::Applied::NeedRoot => {
+            log::info!(target: "service", "device change must reach the installed service: relaunching `service sync` with sudo");
+            let code = elevate::relaunch_elevated(&["service".to_string(), "sync".to_string()])?;
+            // sudo отменён или sync упал: данные в службе остались старыми — сказать, а не молчать.
+            if format!("{code:?}") != format!("{:?}", ExitCode::SUCCESS) {
+                return Err("the installed service was NOT updated: run `sudo cproxy service sync`".into());
+            }
+        }
+        service::Applied::NoService if running() => println!("сервер запущен: перезапустите его (cproxy stop, затем cproxy run --server)"),
+        service::Applied::NoService => {}
+    }
+    Ok(())
 }
 
 fn running() -> bool {
@@ -954,6 +982,7 @@ fn running() -> bool {
 fn server_show() -> Result<ExitCode, String> {
     let cfg = server::Config::load()?;
     let keys = server::Keys::load()?;
+    println!("вход        {} ({})", cfg.protocol.title(), cfg.protocol.id());
     println!("адрес       {}:{} (слушает [{}]:{})", cfg.host, cfg.port, cfg.listen, cfg.port);
     println!("маска       {}", cfg.mask);
     println!("public key  {}", keys.public_key);
@@ -1223,7 +1252,8 @@ fn service_cmd(a: &Args) -> Result<ExitCode, String> {
             service::plan(&src, a.debug != Some(false), service::user_exists())?
         }
         "uninstall" => service::uninstall_plan(a.purge),
-        _ => return Err("usage: cproxy service install [--no-debug] [--dry-run] | uninstall [--purge] [--dry-run] | status".into()),
+        "sync" => service::sync_plan(&store::data_dir())?,
+        _ => return Err("usage: cproxy service install [--no-debug] [--dry-run] | sync [--dry-run] | uninstall [--purge] [--dry-run] | status".into()),
     };
     if a.dry_run {
         println!("план (--dry-run, ничего не выполняется):");
@@ -1252,6 +1282,8 @@ fn service_cmd(a: &Args) -> Result<ExitCode, String> {
     service::execute(&steps)?;
     if what == "install" {
         println!("служба установлена и запущена: cproxy service status; логи — {}/logs; sudo {}/cproxy server status", service::HOME, service::LIB);
+    } else if what == "sync" {
+        println!("данные сервера скопированы в {}, служба перезапущена", service::HOME);
     } else if a.purge {
         println!("служба удалена вместе с ключами сервера");
     } else {
@@ -1328,6 +1360,7 @@ fn run(a: &Args) -> Result<ExitCode, String> {
             ask_configs(&mut Settings::load(), rules, connection);
         }
     }
+    check_mode_flags(a)?;
     // Сервер не трогает трафик этой машины: без TUN и системного прокси.
     let tun = !a.server && tun_wanted(a);
     let ks = kill_switch_wanted(a);
@@ -1374,7 +1407,13 @@ TUN: cproxy запущен в новом окне с правами админи
         let v = String::from_utf8_lossy(&out.stdout);
         log::debug!(target: "cli", "sing-box {}", v.lines().next().unwrap_or("?").trim_start_matches("sing-box version "));
     }
-    if !a.server && fetch(a, true)? != ExitCode::SUCCESS {
+    // global/strict: [Rule] не исполняется — RULE-SET не нужны, и лишних прямых загрузок до старта нет.
+    let mode = mode_wanted(a);
+    if mode.global() {
+        log::info!(target: "cli", "mode {}: all traffic and DNS go through PROXY, LAN direct; .conf rules are not executed{}", mode.name(),
+            if mode == Mode::Strict { "; TUN + kill switch: without the server there is no internet" } else { "" });
+    }
+    if !a.server && !mode.global() && fetch(a, true)? != ExitCode::SUCCESS {
         log::warn!(target: "cli", "some resources failed to download; rules using them are skipped");
     }
     let out = build(a)?;
